@@ -1588,31 +1588,6 @@ align_stock_image_root() {
     return 1
 }
 
-erofs_stock_uuid() {
-    image="$1"
-    log="$WORK/erofs-stock-uuid.log"
-    : >"$log" 2>/dev/null || true
-
-    if [ -n "$DUMP_EROFS" ] && [ -x "$DUMP_EROFS" ]; then
-        "$DUMP_EROFS" -s "$image" >>"$log" 2>&1 || true
-        "$DUMP_EROFS" "$image" >>"$log" 2>&1 || true
-    fi
-
-    if [ -n "$FSCK_EROFS" ] && [ -x "$FSCK_EROFS" ]; then
-        "$FSCK_EROFS" "$image" >>"$log" 2>&1 || true
-    fi
-
-    if command -v strings >/dev/null 2>&1; then
-        strings "$image" 2>/dev/null | grep -i 'uuid' >>"$log" 2>&1 || true
-    fi
-
-    grep -Eio '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$log" 2>/dev/null | head -n 1
-}
-
-erofs_uuid_is_valid() {
-    printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-}
-
 stock_selinux_label() {
     path="$1"
     label=""
@@ -1702,9 +1677,8 @@ run_mkfs_erofs_with_metadata() {
     out="$2"
     image_root="$3"
     compression="$4"
-    stock_uuid="$5"
-    fs_config="$6"
-    file_contexts="$7"
+    fs_config="$5"
+    file_contexts="$6"
     mount_point="$(mkfs_mount_point_for_partition "$part")" || abort "No mkfs mount point for $part"
     fixed_time="1230768000"
 
@@ -1712,7 +1686,7 @@ run_mkfs_erofs_with_metadata() {
     ui_print "- mkfs output image: $out"
     ui_print "- mkfs mount point: $mount_point"
     ui_print "- mkfs fixed timestamp: $fixed_time"
-    ui_print "- mkfs stock UUID: ${stock_uuid:-<none>}"
+    ui_print "- mkfs UUID argument: omitted"
     ui_print "- mkfs fs_config: ${fs_config:-<none>}"
     ui_print "- mkfs file_contexts: ${file_contexts:-<none>}"
 
@@ -1727,13 +1701,7 @@ run_mkfs_erofs_with_metadata() {
         ui_print "WARNING: fixed timestamp empty; omitting -T"
     fi
 
-    if [ -n "$stock_uuid" ] && erofs_uuid_is_valid "$stock_uuid"; then
-        mkfs_args="$mkfs_args -U $stock_uuid"
-    elif [ -n "$stock_uuid" ]; then
-        ui_print "WARNING: invalid stock UUID '$stock_uuid'; omitting -U"
-    else
-        ui_print "WARNING: stock UUID unavailable; omitting -U"
-    fi
+    ui_print "- mkfs UUID argument: omitted to avoid device mkfs UUID parser failures"
 
     if [ -n "$mount_point" ]; then
         mkfs_args="$mkfs_args --mount-point $mount_point"
@@ -1965,7 +1933,6 @@ install_erofs_partition() {
     if [ -z "$stock_image_root" ] || [ ! -d "$stock_image_root" ]; then
         stock_image_root="$(select_mounted_image_root "$part" "$stock_mount_point" "$stock_target_root")" || abort "Failed selecting stock $part image root"
     fi
-    stock_uuid="$(erofs_stock_uuid "$img" 2>/dev/null || true)"
     fs_config="$WORK/$part-erofs-fs_config"
     file_contexts="$WORK/$part-erofs-file_contexts"
     ui_print "- df after extraction:"
@@ -2004,7 +1971,7 @@ install_erofs_partition() {
     compression="$(manifest_string erofs_compression)"
     [ -n "$compression" ] || compression="lz4hc,12"
     ui_print "- Repacking $part EROFS"
-    run_mkfs_erofs_with_metadata "$part" "$out" "$image_root" "$compression" "$stock_uuid" "$fs_config" "$file_contexts"
+    run_mkfs_erofs_with_metadata "$part" "$out" "$image_root" "$compression" "$fs_config" "$file_contexts"
     if [ -n "$FSCK_EROFS" ] && [ -x "$FSCK_EROFS" ]; then
         run_logged "fsck-erofs-${part}" "$FSCK_EROFS" "$out" || abort "fsck.erofs failed for $part"
     fi

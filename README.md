@@ -46,9 +46,9 @@ device and firmware build.
   `extract.erofs -x`, patched in-place, rebuilt from the full extracted image
   root, and verified by extracting the rebuilt image again.
 - EROFS rebuilds preserve stock-like filesystem metadata using the extracted
-  stock `fs_config` and `file_contexts`, the stock UUID, the stock 2009
-  timestamp, and stock-compatible mkfs options. The rebuild intentionally avoids
-  `big_pcluster`.
+  stock `fs_config` and `file_contexts`, the stock 2009 timestamp, and
+  stock-compatible mkfs options. The rebuild intentionally omits `mkfs.erofs -U`
+  and avoids `big_pcluster`.
 - If a rebuilt EROFS image is larger than the current logical partition, the
   installer warns, resizes the active logical partition with `lptools resize`,
   rechecks the mapper size, and only then writes the rebuilt image.

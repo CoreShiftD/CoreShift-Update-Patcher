@@ -3,9 +3,9 @@
 ## Reinitialized release package
 
 - Reinitialized release artifacts from the verified working source tree.
-- Fixed EROFS UUID validation: only canonical UUIDs are accepted.
-- Invalid or missing UUIDs now omit `-U` instead of failing `mkfs.erofs`.
-- Confirmed on-device dry-run: `-U 9` fails, while no-UUID and valid-UUID builds pass.
+- EROFS rebuilds now omit the `mkfs.erofs -U` UUID argument entirely.
+- This prevents invalid or short UUID values such as `9` from reaching `mkfs.erofs`.
+- Confirmed on-device dry-run: `-U 9` fails, while no-UUID builds pass.
 - Preserves current metadata-matching EROFS rebuild improvements.
 - Recovery flash/writeback remains experimental until confirmed on the target device.
 
@@ -22,8 +22,8 @@ Initial release baseline for CoreShift Update Patcher.
   target root in-place, rebuild from the full extracted image root, and verify
   the rebuilt image with extraction.
 - Updated EROFS mkfs behavior to preserve stock-like metadata with stock
-  `fs_config`, stock `file_contexts`, stock UUID, fixed 2009 timestamp,
-  `--mount-point`, and no `big_pcluster`.
+  `fs_config`, stock `file_contexts`, fixed 2009 timestamp, `--mount-point`,
+  and no `big_pcluster`. UUID is intentionally omitted.
 - Added EROFS oversize handling: validation reports oversize as a warning, while
   install mode resizes the active logical partition with `lptools resize`,
   rechecks mapper capacity, and only writes the rebuilt image after it fits.
