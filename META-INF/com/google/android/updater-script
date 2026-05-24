@@ -1,0 +1,3 @@
+# Legacy recovery compatibility entrypoint.
+# The real installer logic is implemented by META-INF/com/google/android/update-binary.
+ui_print("Recovery system repack flasher");

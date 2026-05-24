@@ -1,0 +1,29 @@
+{
+  "name": "CoreShift Update Patcher device profile",
+  "version": 1,
+  "expected_device": "example_device",
+  "accepted_fingerprints": [
+    "vendor/product/device:release/build-id/incremental:user/release-keys"
+  ],
+  "expected_build_release": "14",
+  "expected_build_sdk": "34",
+  "expected_build_id": "BUILD_ID",
+  "expected_build_incremental": "INCREMENTAL",
+  "allow_resize": true,
+  "resize_safety_margin_bytes": 67108864,
+  "dynamic_partition_alignment_bytes": 1048576,
+  "erofs_compression": "lz4hc,12",
+  "files": {
+    "system/path/to/public-placeholder": {
+      "partition": "system",
+      "target_path": "/system/path/to/target",
+      "original_sha256": "replace-with-original-file-sha256",
+      "patched_sha256": "replace-with-patched-payload-sha256",
+      "size": 0
+    }
+  },
+  "delete": {},
+  "payload_paths": [
+    "payload/system/path/to/public-placeholder"
+  ]
+}

@@ -1,0 +1,2181 @@
+#!/sbin/sh
+
+OUTFD="/proc/self/fd/$2"
+ZIPFILE="$3"
+RUNTIME_TMP="/tmp/inoi-runtime-framework-fixes.$$"
+WORK="$RUNTIME_TMP"
+HEAVY_WORKDIR=""
+TOOLS="/tmp/META-INF"
+STEP="startup"
+PACKAGE_ID="inoi_production_runtime_framework_fixes"
+MARKER_REL="etc/inoi_runtime_fixes_applied.prop"
+SIZE_WARNINGS=""
+NOT_FLASHABLE_OVERSIZE=""
+INSTALL_BLOCKED=0
+
+export PATH="/sbin:/system/bin:/system_ext/bin:/vendor/bin:$PATH"
+
+TARGETS="
+system/framework/framework.jar
+system/lib64/libandroid_runtime.so
+system/lib/libandroid_runtime.so
+system_ext/framework/mediatek-services.jar
+"
+
+DELETE_TARGETS="
+system_ext/framework/mediatek-services.jar.fsv_meta
+system_ext/framework/oat/arm/mediatek-services.odex
+system_ext/framework/oat/arm/mediatek-services.vdex
+system_ext/framework/oat/arm64/mediatek-services.odex
+system_ext/framework/oat/arm64/mediatek-services.vdex
+system_ext/framework/oat/arm/mediatek-services.odex.fsv_meta
+system_ext/framework/oat/arm/mediatek-services.vdex.fsv_meta
+system_ext/framework/oat/arm64/mediatek-services.odex.fsv_meta
+system_ext/framework/oat/arm64/mediatek-services.vdex.fsv_meta
+"
+
+ui_print() {
+    echo -e "ui_print $1\nui_print" >> "$OUTFD"
+}
+
+cleanup() {
+    [ -n "$SYSTEM_CLASSIFY_MOUNT" ] && safe_umount "$SYSTEM_CLASSIFY_MOUNT" "system classification" >/dev/null 2>&1
+    [ -n "$SYSTEM_EXT_CLASSIFY_MOUNT" ] && safe_umount "$SYSTEM_EXT_CLASSIFY_MOUNT" "system_ext classification" >/dev/null 2>&1
+    [ -n "$SYSTEM_MOUNT" ] && umount "$SYSTEM_MOUNT" >/dev/null 2>&1
+    [ -n "$SYSTEM_EXT_MOUNT" ] && umount "$SYSTEM_EXT_MOUNT" >/dev/null 2>&1
+    [ -n "$VERIFY_MOUNT" ] && umount "$VERIFY_MOUNT" >/dev/null 2>&1
+    case "$RUNTIME_TMP" in
+        /tmp/inoi-runtime-framework-fixes.*) rm -rf "$RUNTIME_TMP" ;;
+    esac
+    case "$HEAVY_WORKDIR" in
+        /data/local/tmp/inoi-runtime-framework-fixes.*|/data/tmp/inoi-runtime-framework-fixes.*|/tmp/inoi-runtime-framework-fixes.*)
+            [ "$HEAVY_WORKDIR" != "$RUNTIME_TMP" ] && rm -rf "$HEAVY_WORKDIR"
+            ;;
+    esac
+}
+
+abort() {
+    ui_print " "
+    ui_print "ERROR at $STEP: $1"
+    ui_print "Aborting."
+    cleanup
+    exit 1
+}
+
+run() {
+    "$@" || abort "Command failed: $*"
+}
+
+print_log_tail() {
+    log="$1"
+    [ -f "$log" ] || return 0
+
+    ui_print "  last log lines:"
+    tail -40 "$log" 2>/dev/null | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' 2>/dev/null | tr -cd '[:print:]\t\n ' | while IFS= read -r line; do
+        clean="$(printf '%s' "$line" | tr -cd '[:print:]\t ')"
+        ui_print "  $clean"
+    done
+}
+
+run_logged() {
+    label="$1"
+    shift
+
+    log="$RUNTIME_TMP/${label}.log"
+    rm -f "$log"
+
+    ui_print "- Running: $label"
+    "$@" >"$log" 2>&1
+    rc="$?"
+
+    if [ "$rc" -ne 0 ]; then
+        ui_print "- Command failed: $label rc=$rc"
+        ui_print "  log: $log"
+        if [ -n "$HEAVY_WORKDIR" ] && [ -d "$HEAVY_WORKDIR" ]; then
+            failed_log_dir="$HEAVY_WORKDIR/failed-logs"
+            mkdir -p "$failed_log_dir" 2>/dev/null || true
+            cp -f "$log" "$failed_log_dir/${label}.log" 2>/dev/null || true
+            ui_print "  saved full log: $failed_log_dir/${label}.log"
+        fi
+        print_log_tail "$log"
+        return "$rc"
+    fi
+
+    ui_print "- Command succeeded: $label"
+    return 0
+}
+
+size_value_or_file() {
+    value="$1"
+
+    if [ -f "$value" ]; then
+        wc -c < "$value" 2>/dev/null
+        return
+    fi
+
+    case "$value" in
+        *[!0-9]*|"") echo 0 ;;
+        *) echo "$value" ;;
+    esac
+}
+
+mapper_size_for_report() {
+    block="$1"
+    fallback="$2"
+    out=""
+
+    if [ -n "$BLOCKDEV" ] && [ -x "$BLOCKDEV" ]; then
+        out="$("$BLOCKDEV" --getsize64 "$block" 2>/dev/null)"
+    fi
+
+    if [ -z "$out" ] && [ -n "$TOYBOX" ] && [ -x "$TOYBOX" ]; then
+        out="$("$TOYBOX" blockdev --getsize64 "$block" 2>/dev/null)"
+    fi
+
+    case "$out" in
+        *[!0-9]*|"") out="$fallback" ;;
+    esac
+
+    echo "$out"
+}
+
+append_unique_word() {
+    list="$1"
+    word="$2"
+
+    case " $list " in
+        *" $word "*) echo "$list" ;;
+        *) echo "$list $word" ;;
+    esac
+}
+
+remove_word() {
+    list="$1"
+    word="$2"
+    out=""
+
+    for item in $list; do
+        [ "$item" = "$word" ] && continue
+        out="$out $item"
+    done
+
+    echo "$out"
+}
+
+check_image_size_report() {
+    logical="$1"
+    old_image_or_size="$2"
+    new_image="$3"
+    block_path="$4"
+    fallback_block_size="$5"
+
+    old_size="$(size_value_or_file "$old_image_or_size")"
+    new_size="$(size_value_or_file "$new_image")"
+    [ -n "$fallback_block_size" ] || fallback_block_size="$old_size"
+    block_size="$(mapper_size_for_report "$block_path" "$fallback_block_size")"
+
+    [ -z "$old_size" ] && old_size=0
+    [ -z "$new_size" ] && new_size=0
+    [ -z "$block_size" ] && block_size="$old_size"
+
+    delta=$((new_size - old_size))
+
+    ui_print "- $logical size report:"
+    ui_print "  original image: $old_size"
+    ui_print "  rebuilt image:  $new_size"
+    ui_print "  mapper size:    $block_size"
+    ui_print "  delta:          $delta"
+
+    if [ "$new_size" -gt "$old_size" ]; then
+        ui_print "WARNING: rebuilt $logical image is larger than original by $delta bytes"
+        SIZE_WARNINGS="$(append_unique_word "$SIZE_WARNINGS" "$logical")"
+        if [ "$new_size" -le "$block_size" ]; then
+            ui_print "WARNING: rebuilt $logical image is larger than original but fits mapper/block size"
+        fi
+    fi
+
+    if [ "$new_size" -gt "$block_size" ]; then
+        ui_print "WARNING: rebuilt $logical image is larger than mapper/block size"
+        ui_print "WARNING: rebuilt $logical image does not fit partition; install/writeback is blocked"
+        NOT_FLASHABLE_OVERSIZE="$(append_unique_word "$NOT_FLASHABLE_OVERSIZE" "$logical")"
+        return 2
+    fi
+
+    return 0
+}
+
+pick_heavy_workdir() {
+    base_candidates="/data/local/tmp /data/tmp /tmp"
+
+    for base in $base_candidates; do
+        mkdir -p "$base" 2>/dev/null || continue
+
+        testdir="$base/inoi-runtime-framework-fixes.$$"
+        mkdir -p "$testdir" 2>/dev/null || continue
+
+        if [ -d "$testdir" ] && [ -w "$testdir" ]; then
+            echo "$testdir"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+check_workdir_space() {
+    dir="$1"
+    label="$2"
+
+    ui_print "- df for $label:"
+    df "$dir" 2>&1 | while read line; do ui_print "  $line"; done
+
+    avail_kb="$(df "$dir" 2>/dev/null | awk 'NR==2 {print $4}')"
+    [ -z "$avail_kb" ] && return 0
+
+    if [ "$avail_kb" -lt 3145728 ]; then
+        ui_print "WARNING: low free space in $dir for $label: ${avail_kb}KB"
+    fi
+}
+
+init_workdirs() {
+    mkdir -p "$RUNTIME_TMP" || abort "Failed creating runtime tmp"
+    HEAVY_WORKDIR="$(pick_heavy_workdir)" || abort "No writable workdir for heavy EROFS operations"
+
+    ui_print "- runtime tmp: $RUNTIME_TMP"
+    ui_print "- heavy workdir: $HEAVY_WORKDIR"
+    ui_print "- heavy workdir df:"
+    df "$HEAVY_WORKDIR" 2>&1 | while read line; do ui_print "  $line"; done
+
+    case "$HEAVY_WORKDIR" in
+        /tmp/*)
+            ui_print "WARNING: heavy workdir is /tmp tmpfs; large EROFS work may fail due to RAM limits"
+            ;;
+    esac
+}
+
+zip_extract() {
+    unzip -o "$ZIPFILE" "$1" -d "$2" >/dev/null 2>&1
+}
+
+zip_list() {
+    unzip -l "$ZIPFILE" | awk 'NR > 3 && $0 !~ /^---------/ { print $4 }' | sed '/^$/d'
+}
+
+zip_has() {
+    unzip -l "$ZIPFILE" "$1" >/dev/null 2>&1
+}
+
+tool_path() {
+    name="$1"
+    bundled="$TOOLS/$name"
+    if [ -x "$bundled" ]; then
+        printf '%s' "$bundled"
+        return
+    fi
+    command -v "$name" 2>/dev/null
+}
+
+bundled_tool_path() {
+    name="$1"
+    bundled="$TOOLS/$name"
+    [ -x "$bundled" ] && printf '%s' "$bundled"
+}
+
+optional_tool() {
+    var="$1"
+    name="$2"
+    path="$(tool_path "$name")"
+    eval "$var=\"\$path\""
+}
+
+mkfs_mount_point_for_partition() {
+    case "$1" in
+        system) printf '%s' "/system" ;;
+        system_ext) printf '%s' "/system_ext" ;;
+        *) return 1 ;;
+    esac
+}
+
+config_path_for_mkfs() {
+    part="$1"
+    rel="$2"
+    mount_point="$(mkfs_mount_point_for_partition "$part")" || return 1
+    prefix="${mount_point#/}"
+    if [ -n "$rel" ] && [ "$rel" != "." ]; then
+        printf '%s/%s' "$prefix" "$rel"
+    else
+        printf '%s' "$prefix"
+    fi
+}
+
+escape_file_context_path() {
+    printf '%s' "$1" | sed 's/[.[\*^$()+?{}|\\]/\\&/g'
+}
+
+optional_bundled_tool() {
+    var="$1"
+    name="$2"
+    path="$(bundled_tool_path "$name")"
+    eval "$var=\"\$path\""
+}
+
+require_tool() {
+    var="$1"
+    name="$2"
+    optional_tool "$var" "$name"
+    eval "path=\"\$$var\""
+    [ -n "$path" ] && [ -x "$path" ] || abort "Required tool missing: $name"
+}
+
+hash_file() {
+    "$SHA256" "$1" | awk '{print $1}'
+}
+
+manifest_string() {
+    key="$1"
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$MANIFEST" | head -n 1
+}
+
+manifest_bool() {
+    key="$1"
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p" "$MANIFEST" | head -n 1
+}
+
+manifest_array_strings() {
+    key="$1"
+    awk -v key="$key" '
+        function emit(value) {
+            gsub(/\r/, "", value)
+            gsub(/^[[:space:]\[]*/, "", value)
+            gsub(/[[:space:]\]]*$/, "", value)
+            gsub(/^[[:space:]]*"/, "", value)
+            gsub(/",?[[:space:]]*$/, "", value)
+            gsub(/^[[:space:]]*/, "", value)
+            gsub(/[[:space:]]*$/, "", value)
+            if (value != "") print value
+        }
+        $0 ~ "\"" key "\"" {
+            in_array=1
+            sub(/^.*\[/, "", $0)
+        }
+        in_array {
+            line=$0
+            done=0
+            if (line ~ /\]/) {
+                sub(/\].*$/, "", line)
+                done=1
+            }
+            n=split(line, values, ",")
+            for (i=1; i<=n; i++) emit(values[i])
+            if (done) exit
+        }
+    ' "$MANIFEST"
+}
+
+write_accepted_fingerprint_file() {
+    out="$1"
+    printf '%s\n' "$accepted_fingerprints" |
+        sed 's/\r//g; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"[,]*$//; s/^\[//; s/\]$//' |
+        sed '/^$/d' > "$out"
+}
+
+debug_escape() {
+    printf '%s' "$1" | sed -n l
+}
+
+prop_value() {
+    getprop "$1" 2>/dev/null | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//'
+}
+
+normalize_value() {
+    printf '%s' "$1" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//'
+}
+
+json_hash_for_path() {
+    path="$1"
+    key="$2"
+    awk -v path="$path" -v key="$key" '
+        $0 ~ "\"" path "\"" { in_file=1 }
+        in_file && $0 ~ "\"" key "\"" {
+            line=$0
+            gsub(/.*: *"/, "", line)
+            gsub(/".*/, "", line)
+            print line
+            exit
+        }
+        in_file && $0 ~ /^[[:space:]]*}[,]?[[:space:]]*$/ { in_file=0 }
+    ' "$MANIFEST"
+}
+
+target_key() {
+    case "$1" in
+        system/framework/framework.jar) printf '%s' "framework_jar" ;;
+        system/lib64/libandroid_runtime.so) printf '%s' "lib64_libandroid_runtime_so" ;;
+        system/lib/libandroid_runtime.so) printf '%s' "lib_libandroid_runtime_so" ;;
+        system_ext/framework/mediatek-services.jar) printf '%s' "mediatek_services_jar" ;;
+    esac
+}
+
+required_hash() {
+    t="$1"
+    kind="$2"
+    h="$(json_hash_for_path "$t" "$kind")"
+    [ -n "$h" ] || h="$(json_hash_for_path "payload/$t" "$kind")"
+    if [ -z "$h" ]; then
+        k="$(target_key "$t")"
+        case "$kind" in
+            original_sha256) h="$(manifest_string "original_${k}_sha256")" ;;
+            patched_sha256) h="$(manifest_string "patched_${k}_sha256")" ;;
+        esac
+    fi
+    [ -n "$h" ] || abort "manifest.json missing $kind for $t"
+    printf '%s' "$h"
+}
+
+is_allowed_target() {
+    p="$1"
+    for t in $TARGETS; do
+        [ "$p" = "$t" ] && return 0
+    done
+    return 1
+}
+
+is_allowed_delete() {
+    p="$1"
+    for t in $DELETE_TARGETS; do
+        [ "$p" = "$t" ] && return 0
+    done
+    return 1
+}
+
+payload_to_target() {
+    case "$1" in
+        payload/system/*|payload/system_ext/*) printf '%s' "${1#payload/}" ;;
+        system/*|system_ext/*) printf '%s' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+target_to_payload_entry() {
+    t="$1"
+    if zip_has "payload/$t"; then
+        printf '%s' "payload/$t"
+        return 0
+    fi
+    if zip_has "$t"; then
+        printf '%s' "$t"
+        return 0
+    fi
+    return 1
+}
+
+target_partition() {
+    case "$1" in
+        system_ext/*) printf '%s' "system_ext" ;;
+        system/*) printf '%s' "system" ;;
+        *) return 1 ;;
+    esac
+}
+
+target_fs_path() {
+    case "$1" in
+        system_ext/*) printf '%s' "${1#system_ext/}" ;;
+        system/*) printf '%s' "${1#system/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+mounted_target_candidates() {
+    t="$1"
+    rel="$(target_fs_path "$t")"
+    case "$t" in
+        system_ext/*)
+            printf '%s\n' \
+                "/system_ext/$rel" \
+                "/system_root/system_ext/$rel" \
+                "/mnt/system_ext/$rel" \
+                "/mnt/system/system_ext/$rel"
+            ;;
+        system/*)
+            printf '%s\n' \
+                "/system/$rel" \
+                "/system_root/system/$rel" \
+                "/mnt/system/system/$rel" \
+                "/mnt/system/$rel"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_mounted_target() {
+    t="$1"
+    mounted_target_candidates "$t" | while read candidate; do
+        if [ -f "$candidate" ]; then
+            printf '%s' "$candidate"
+            exit 0
+        fi
+    done
+}
+
+print_recovery_mount_layout() {
+    ui_print " "
+    ui_print "Recovery mount layout:"
+    if [ -r /proc/mounts ]; then
+        grep -E ' (/system|/system_root|/system_ext|/mnt/system|/mnt/system_ext)( |/)' /proc/mounts 2>/dev/null |
+            while read line; do ui_print "  mount: $line"; done
+    fi
+    for p in /system /system_root /system_ext /mnt/system /mnt/system_ext; do
+        if [ -e "$p" ]; then
+            ls -ld "$p" 2>&1 | while read line; do ui_print "  ls: $line"; done
+        else
+            ui_print "  ls: $p: not present"
+        fi
+    done
+}
+
+is_mounted() {
+    mount_point="$1"
+    grep -q " $mount_point " /proc/mounts 2>/dev/null
+}
+
+safe_umount() {
+    mount_point="$1"
+    label="$2"
+    [ -n "$mount_point" ] || return 0
+    is_mounted "$mount_point" || return 0
+    if umount "$mount_point" 2>/dev/null; then
+        ui_print "- Unmounted $label: $mount_point"
+        return 0
+    fi
+    ui_print "- Normal unmount failed for $label: $mount_point"
+    ui_print "- Trying lazy unmount for $label"
+    umount -l "$mount_point" 2>/dev/null || return 1
+}
+
+unmount_or_abort() {
+    mount_point="$1"
+    label="$2"
+    safe_umount "$mount_point" "$label" || abort "Failed unmounting $label: $mount_point"
+}
+
+classification_mountpoint_for_partition() {
+    case "$1" in
+        system) printf '%s' "$WORK/mnt_system" ;;
+        system_ext) printf '%s' "$WORK/mnt_system_ext" ;;
+        *) return 1 ;;
+    esac
+}
+
+classification_root_for_partition() {
+    case "$1" in
+        system) printf '%s' "$SYSTEM_MOUNTED_ROOT" ;;
+        system_ext) printf '%s' "$SYSTEM_EXT_MOUNTED_ROOT" ;;
+        *) return 1 ;;
+    esac
+}
+
+classification_block_for_partition() {
+    case "$1" in
+        system) printf '%s' "$SYSTEM_BLOCK" ;;
+        system_ext) printf '%s' "$SYSTEM_EXT_BLOCK" ;;
+        *) return 1 ;;
+    esac
+}
+
+classification_fs_for_partition() {
+    case "$1" in
+        system) printf '%s' "$SYSTEM_FS" ;;
+        system_ext) printf '%s' "$SYSTEM_EXT_FS" ;;
+        *) return 1 ;;
+    esac
+}
+
+set_classification_mount_for_partition() {
+    part="$1"
+    mount_point="$2"
+    case "$part" in
+        system) SYSTEM_CLASSIFY_MOUNT="$mount_point" ;;
+        system_ext) SYSTEM_EXT_CLASSIFY_MOUNT="$mount_point" ;;
+    esac
+}
+
+clear_classification_mount_for_partition() {
+    case "$1" in
+        system)
+            SYSTEM_CLASSIFY_MOUNT=""
+            SYSTEM_MOUNTED_ROOT=""
+            ;;
+        system_ext)
+            SYSTEM_EXT_CLASSIFY_MOUNT=""
+            SYSTEM_EXT_MOUNTED_ROOT=""
+            ;;
+    esac
+}
+
+select_mounted_root() {
+    part="$1"
+    mount_point="$2"
+    case "$part" in
+        system)
+            for root in "$mount_point/system" "$mount_point" "$mount_point/system/system"; do
+                if [ -f "$root/framework/framework.jar" ]; then
+                    SYSTEM_MOUNTED_ROOT="$root"
+                    ui_print "- Selected mounted root for system: $root"
+                    return 0
+                fi
+            done
+            ;;
+        system_ext)
+            for root in "$mount_point/system_ext" "$mount_point" "$mount_point/system/system_ext"; do
+                if [ -f "$root/framework/framework-res.apk" ] || [ -f "$root/framework/mediatek-services.jar" ]; then
+                    SYSTEM_EXT_MOUNTED_ROOT="$root"
+                    ui_print "- Selected mounted root for system_ext: $root"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+mount_partition_ro_for_classification() {
+    part="$1"
+    block="$(classification_block_for_partition "$part")" || return 1
+    fs="$(classification_fs_for_partition "$part")" || return 1
+    mount_point="$(classification_mountpoint_for_partition "$part")" || return 1
+
+    case "$fs" in
+        erofs|ext4) ;;
+        *) return 1 ;;
+    esac
+
+    existing="$(classification_root_for_partition "$part")"
+    if [ -n "$existing" ] && [ -d "$existing" ]; then
+        return 0
+    fi
+
+    mkdir -p "$mount_point"
+    set_classification_mount_for_partition "$part" "$mount_point"
+    exact_mount_log="$WORK/$part-classification-mount-exact.log"
+    generic_mount_log="$WORK/$part-classification-mount-generic.log"
+    ui_print "- Manual classification mount for $part"
+    ui_print "  mapped block: $block"
+    ui_print "  filesystem: $fs"
+    ui_print "  command: mount -t $fs -o ro $block $mount_point"
+    if ! is_mounted "$mount_point"; then
+        mount -t "$fs" -o ro "$block" "$mount_point" 2>"$exact_mount_log" || {
+            ui_print "  exact mount command failed:"
+            print_log_head "$exact_mount_log"
+            ui_print "  exact mount command failed; trying generic read-only mount"
+            mount -o ro "$block" "$mount_point" 2>"$generic_mount_log" || {
+                ui_print "  generic mount command failed:"
+                print_log_head "$generic_mount_log"
+                clear_classification_mount_for_partition "$part"
+                return 1
+            }
+        }
+    fi
+    select_mounted_root "$part" "$mount_point" || {
+        ui_print "- Mounted root probe failed for $part"
+        ui_print "  probed:"
+        case "$part" in
+            system)
+                ui_print "    $mount_point/system/framework/framework.jar"
+                ui_print "    $mount_point/framework/framework.jar"
+                ui_print "    $mount_point/system/system/framework/framework.jar"
+                ;;
+            system_ext)
+                ui_print "    $mount_point/system_ext/framework/framework-res.apk"
+                ui_print "    $mount_point/system_ext/framework/mediatek-services.jar"
+                ui_print "    $mount_point/framework/framework-res.apk"
+                ui_print "    $mount_point/framework/mediatek-services.jar"
+                ui_print "    $mount_point/system/system_ext/framework/framework-res.apk"
+                ui_print "    $mount_point/system/system_ext/framework/mediatek-services.jar"
+                ;;
+        esac
+        unmount_or_abort "$mount_point" "$part classification mount"
+        clear_classification_mount_for_partition "$part"
+        return 1
+    }
+}
+
+unmount_classification_mount() {
+    part="$1"
+    case "$part" in
+        system) mount_point="$SYSTEM_CLASSIFY_MOUNT" ;;
+        system_ext) mount_point="$SYSTEM_EXT_CLASSIFY_MOUNT" ;;
+        *) return 0 ;;
+    esac
+    [ -n "$mount_point" ] || return 0
+    unmount_or_abort "$mount_point" "$part classification mount"
+    clear_classification_mount_for_partition "$part"
+}
+
+manifest_uint_default() {
+    key="$1"
+    default="$2"
+    value="$(manifest_string "$key")"
+    case "$value" in
+        *[!0-9]*|"") value="$default" ;;
+    esac
+    printf '%s' "$value"
+}
+
+print_banner() {
+    ui_print " "
+    ui_print "----------------------------------------"
+    ui_print "- INOI production runtime fixes        -"
+    ui_print "- Active-slot framework patcher        -"
+    ui_print "----------------------------------------"
+}
+
+extract_metadata_and_tools() {
+    STEP="extract package metadata and tools"
+    mkdir -p "$WORK" "$TOOLS"
+    zip_extract "manifest.json" "$WORK" || abort "manifest.json missing"
+    MANIFEST="$WORK/manifest.json"
+    [ -s "$MANIFEST" ] || abort "manifest.json is empty"
+
+    for t in avbctl lptools zstd xz extract.erofs mkfs.erofs resize2fs e2fsck fsck.erofs; do
+        zip_extract "META-INF/$t" /tmp >/dev/null 2>&1 || true
+    done
+    chmod -R 0755 "$TOOLS" 2>/dev/null
+
+    require_tool SHA256 sha256sum
+    require_tool DD dd
+    optional_bundled_tool LPTOOLS lptools
+    optional_bundled_tool AVBCTL avbctl
+    optional_tool GETPROP getprop
+    optional_tool BLOCKDEV blockdev
+    optional_tool TOYBOX toybox
+    optional_tool BLKID blkid
+    optional_tool FILE file
+    optional_tool HEXDUMP hexdump
+    optional_tool OD od
+    optional_bundled_tool DUMP_EROFS dump.erofs
+    optional_tool TUNE2FS tune2fs
+    optional_bundled_tool RESIZE2FS resize2fs
+    optional_bundled_tool E2FSCK e2fsck
+    optional_bundled_tool EXTRACT_EROFS extract.erofs
+    optional_bundled_tool MKFS_EROFS mkfs.erofs
+    optional_bundled_tool FSCK_EROFS fsck.erofs
+    optional_tool CHCON chcon
+}
+
+validate_payload_allowlist() {
+    STEP="validate payload allowlist"
+    entries="$(zip_list)"
+    for e in $entries; do
+        case "$e" in
+            */) continue ;;
+            META-INF/*|manifest.json|checksums.txt|README.md) continue ;;
+            payload/system/*|payload/system_ext/*|system/*|system_ext/*)
+                t="$(payload_to_target "$e")" || abort "Invalid payload path: $e"
+                is_allowed_target "$t" || abort "Unapproved payload path: $e"
+                ;;
+            *) abort "Unapproved ZIP entry: $e" ;;
+        esac
+    done
+
+    for t in $TARGETS; do
+        target_to_payload_entry "$t" >/dev/null || abort "Required payload missing: $t"
+        required_hash "$t" original_sha256 >/dev/null
+        required_hash "$t" patched_sha256 >/dev/null
+    done
+
+    for d in $DELETE_TARGETS; do
+        is_allowed_delete "$d" || abort "Internal delete allowlist error: $d"
+    done
+}
+
+extract_payload() {
+    STEP="extract payload"
+    PAYLOAD_DIR="$WORK/payload"
+    mkdir -p "$PAYLOAD_DIR"
+    for t in $TARGETS; do
+        e="$(target_to_payload_entry "$t")" || abort "Required payload missing: $t"
+        zip_extract "$e" "$PAYLOAD_DIR" || abort "Failed extracting $e"
+        src="$PAYLOAD_DIR/$e"
+        [ -f "$src" ] || abort "Extracted payload not found: $e"
+        patched="$(required_hash "$t" patched_sha256)"
+        got="$(hash_file "$src")"
+        [ "$got" = "$patched" ] || abort "Patched payload hash mismatch for $t"
+    done
+}
+
+detect_slot() {
+    STEP="detect active slot"
+    raw="$(getprop ro.boot.slot_suffix 2>/dev/null)"
+    [ -n "$raw" ] || raw="$(getprop ro.boot.slot 2>/dev/null)"
+    case "$raw" in
+        _a|_b) SLOT="$raw" ;;
+        a|b) SLOT="_$raw" ;;
+        "") SLOT="" ;;
+        *) abort "Unexpected slot value: $raw" ;;
+    esac
+    [ -n "$SLOT" ] && ui_print "- Active slot: $SLOT" || ui_print "- Active slot: none reported"
+}
+
+lptools_list() {
+    [ -n "$LPTOOLS" ] && [ -x "$LPTOOLS" ] || return 1
+    "$LPTOOLS" list 2>/dev/null
+}
+
+resolve_partition() {
+    base="$1"
+    STEP="resolve $base partition"
+    LPINFO="$(lptools_list)"
+    echo "$LPINFO" > "$WORK/lptools-list-$base.txt"
+
+    if [ -n "$SLOT" ]; then
+        part="$base$SLOT"
+    elif echo "$LPINFO" | grep -Eq "(^|[[:space:]])${base}_a([[:space:]]|$)|(^|[[:space:]])${base}_b([[:space:]]|$)"; then
+        abort "Slotted $base partition exists but active slot is unknown"
+    else
+        part="$base"
+    fi
+
+    if echo "$LPINFO" | grep -Eq "(^|[[:space:]])$part([[:space:]]|$)"; then
+        [ -n "$LPTOOLS" ] && "$LPTOOLS" map "$part" >/dev/null 2>&1 || true
+    fi
+
+    for p in "/dev/block/mapper/$part" "/dev/block/by-name/$part" "/dev/block/bootdevice/by-name/$part"; do
+        if [ -e "$p" ]; then
+            block="$(readlink -f "$p" 2>/dev/null)"
+            [ -n "$block" ] || block="$p"
+            eval "$(printf '%s_PART=%s\n%s_BLOCK=%s\n%s_REQUEST_PATH=%s' "$(echo "$base" | tr a-z A-Z)" "$part" "$(echo "$base" | tr a-z A-Z)" "$block" "$(echo "$base" | tr a-z A-Z)" "$p")"
+            ui_print "- $base partition: $part"
+            ui_print "- $base block: $block"
+            return
+        fi
+    done
+    abort "Unable to resolve block device for $part"
+}
+
+print_size_diagnostics() {
+    base="$1"
+    part="$2"
+    block="$3"
+    real="$4"
+    ui_print " "
+    ui_print "Size detection diagnostics for $base:"
+    ui_print "  active slot: ${SLOT:-none}"
+    ui_print "  requested partition: $part"
+    ui_print "  block: $block"
+    ui_print "  readlink -f: $real"
+    ui_print "  blockdev error: $BLOCKDEV_ERR"
+    ui_print "  toybox blockdev error: $TOYBOX_BLOCKDEV_ERR"
+    ui_print "  sysfs paths: $SYSFS_CLASS_SIZE $SYSFS_BLOCK_SIZE"
+    ui_print "  /dev/block/mapper:"
+    ls -l /dev/block/mapper 2>&1 | while read line; do ui_print "    $line"; done
+}
+
+detect_block_size() {
+    base="$1"
+    block="$2"
+    part="$3"
+    STEP="detect $base block size"
+    BLOCKDEV_ERR=""
+    TOYBOX_BLOCKDEV_ERR=""
+    out=""
+
+    if [ -n "$BLOCKDEV" ] && [ -x "$BLOCKDEV" ]; then
+        out="$("$BLOCKDEV" --getsize64 "$block" 2>"$WORK/blockdev-$base.err")"
+        if [ "$?" = "0" ] && [ -n "$out" ]; then
+            eval "$(echo "$base" | tr a-z A-Z)_SIZE=\"$out\""
+            ui_print "- $base size: $out bytes"
+            return
+        fi
+        BLOCKDEV_ERR="$(cat "$WORK/blockdev-$base.err" 2>/dev/null)"
+    fi
+
+    if [ -n "$TOYBOX" ] && [ -x "$TOYBOX" ]; then
+        out="$("$TOYBOX" blockdev --getsize64 "$block" 2>"$WORK/toybox-blockdev-$base.err")"
+        if [ "$?" = "0" ] && [ -n "$out" ]; then
+            eval "$(echo "$base" | tr a-z A-Z)_SIZE=\"$out\""
+            ui_print "- $base size: $out bytes"
+            return
+        fi
+        TOYBOX_BLOCKDEV_ERR="$(cat "$WORK/toybox-blockdev-$base.err" 2>/dev/null)"
+    fi
+
+    real="$(readlink -f "$block" 2>/dev/null)"
+    [ -n "$real" ] || real="$block"
+    real_base="$(basename "$real")"
+    SYSFS_CLASS_SIZE="/sys/class/block/$real_base/size"
+    SYSFS_BLOCK_SIZE="/sys/block/$real_base/size"
+    for s in "$SYSFS_CLASS_SIZE" "$SYSFS_BLOCK_SIZE"; do
+        if [ -r "$s" ]; then
+            sectors="$(cat "$s" 2>/dev/null)"
+            case "$sectors" in
+                *[!0-9]*|"") ;;
+                *) out=$((sectors * 512)); eval "$(echo "$base" | tr a-z A-Z)_SIZE=\"$out\""; ui_print "- $base size: $out bytes"; return ;;
+            esac
+        fi
+    done
+
+    print_size_diagnostics "$base" "$part" "$block" "$real"
+    abort "Unable to detect $base partition size"
+}
+
+detect_fs_type() {
+    base="$1"
+    block="$2"
+    STEP="detect $base filesystem"
+    fs=""
+    if [ -n "$BLKID" ] && [ -x "$BLKID" ]; then
+        fs="$("$BLKID" -s TYPE -o value "$block" 2>/dev/null | head -n 1)"
+        [ "$fs" = "unknown" ] && fs=""
+    fi
+    if [ -z "$fs" ] && [ -n "$FILE" ] && [ -x "$FILE" ]; then
+        case "$("$FILE" -sL "$block" 2>/dev/null)" in
+            *EROFS*|*erofs*) fs="erofs" ;;
+            *ext4*|*Ext4*|*EXT4*) fs="ext4" ;;
+        esac
+    fi
+    if [ -z "$fs" ] && [ -n "$DUMP_EROFS" ] && [ -x "$DUMP_EROFS" ]; then
+        "$DUMP_EROFS" -s "$block" >/dev/null 2>&1 && fs="erofs"
+    fi
+    if [ -z "$fs" ] && [ -n "$TUNE2FS" ] && [ -x "$TUNE2FS" ]; then
+        "$TUNE2FS" -l "$block" >/dev/null 2>&1 && fs="ext4"
+    fi
+    if [ -z "$fs" ]; then
+        erofs_magic=""
+        ext4_magic=""
+        if [ -n "$HEXDUMP" ] && [ -x "$HEXDUMP" ]; then
+            erofs_magic="$("$DD" if="$block" bs=1 skip=1024 count=4 2>/dev/null | "$HEXDUMP" -v -e '1/1 "%02x"' 2>/dev/null)"
+            ext4_magic="$("$DD" if="$block" bs=1 skip=1080 count=2 2>/dev/null | "$HEXDUMP" -v -e '1/1 "%02x"' 2>/dev/null)"
+        elif [ -n "$OD" ] && [ -x "$OD" ]; then
+            erofs_magic="$("$DD" if="$block" bs=1 skip=1024 count=4 2>/dev/null | "$OD" -An -tx1 -v 2>/dev/null | tr -d ' \n')"
+            ext4_magic="$("$DD" if="$block" bs=1 skip=1080 count=2 2>/dev/null | "$OD" -An -tx1 -v 2>/dev/null | tr -d ' \n')"
+        fi
+        case "$erofs_magic:$ext4_magic" in
+            e2e1f5e0:*) fs="erofs" ;;
+            *:53ef) fs="ext4" ;;
+        esac
+    fi
+    fs="$(printf '%s' "$fs" | tr A-Z a-z)"
+    case "$fs" in
+        ext4|erofs) ui_print "- $base filesystem: $fs"; eval "$(echo "$base" | tr a-z A-Z)_FS=\"$fs\"" ;;
+        *) abort "Unsupported or unknown $base filesystem: ${fs:-unknown}" ;;
+    esac
+}
+
+avb_state_enabled() {
+    case "$1 $2" in
+        *[Ee]nabled*|*[Oo]n*|*[Ee]nforcing*|*[Gg]reen*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+print_prop_if_available() {
+    prop="$1"
+    [ -n "$GETPROP" ] && [ -x "$GETPROP" ] || return
+    value="$("$GETPROP" "$prop" 2>/dev/null)"
+    [ -n "$value" ] && ui_print "- $prop: $value"
+    printf '%s' "$value"
+}
+
+report_avb_status() {
+    STEP="report AVB/verity status"
+    ui_print " "
+    ui_print "AVB/verity status:"
+    verity=""
+    verification=""
+    if [ -n "$AVBCTL" ] && [ -x "$AVBCTL" ]; then
+        verity="$("$AVBCTL" get-verity 2>&1)"
+        verification="$("$AVBCTL" get-verification 2>&1)"
+        ui_print "- avbctl get-verity: $verity"
+        ui_print "- avbctl get-verification: $verification"
+    else
+        ui_print "avbctl not available; skipping AVB status query"
+    fi
+
+    boot_status=""
+    boot_status="$boot_status $(print_prop_if_available ro.boot.verifiedbootstate)"
+    boot_status="$boot_status $(print_prop_if_available ro.boot.veritymode)"
+    boot_status="$boot_status $(print_prop_if_available ro.boot.vbmeta.device_state)"
+    boot_status="$boot_status $(print_prop_if_available ro.boot.flash.locked)"
+    boot_status="$boot_status $(print_prop_if_available ro.boot.avb_version)"
+    boot_status="$boot_status $(print_prop_if_available ro.boot.slot_suffix)"
+
+    if avb_state_enabled "$verity $boot_status" "$verification"; then
+        ui_print "WARNING: AVB/verity appears enabled."
+        ui_print "This installer will not modify vbmeta."
+        ui_print "If the device refuses modified partitions, handle vbmeta/verity externally."
+    fi
+}
+
+targets_for_partition() {
+    part="$1"
+    for t in $TARGETS; do
+        [ "$(target_partition "$t")" = "$part" ] && printf '%s\n' "$t"
+    done
+}
+
+plan_add_need() {
+    part="$1"
+    case "$part" in
+        system) SYSTEM_NEEDS_REPLACE_COUNT=$((SYSTEM_NEEDS_REPLACE_COUNT + 1)) ;;
+        system_ext) SYSTEM_EXT_NEEDS_REPLACE_COUNT=$((SYSTEM_EXT_NEEDS_REPLACE_COUNT + 1)) ;;
+    esac
+}
+
+plan_add_patched() {
+    part="$1"
+    case "$part" in
+        system) SYSTEM_ALREADY_PATCHED_COUNT=$((SYSTEM_ALREADY_PATCHED_COUNT + 1)) ;;
+        system_ext) SYSTEM_EXT_ALREADY_PATCHED_COUNT=$((SYSTEM_EXT_ALREADY_PATCHED_COUNT + 1)) ;;
+    esac
+}
+
+partition_needs_replace_count() {
+    case "$1" in
+        system) printf '%s' "$SYSTEM_NEEDS_REPLACE_COUNT" ;;
+        system_ext) printf '%s' "$SYSTEM_EXT_NEEDS_REPLACE_COUNT" ;;
+        *) printf '0' ;;
+    esac
+}
+
+partition_already_patched_count() {
+    case "$1" in
+        system) printf '%s' "$SYSTEM_ALREADY_PATCHED_COUNT" ;;
+        system_ext) printf '%s' "$SYSTEM_EXT_ALREADY_PATCHED_COUNT" ;;
+        *) printf '0' ;;
+    esac
+}
+
+partition_target_count() {
+    count=0
+    for t in $(targets_for_partition "$1"); do
+        count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+partition_needs_work() {
+    [ "$(partition_needs_replace_count "$1")" != "0" ]
+}
+
+any_partition_needs_work() {
+    partition_needs_work system || partition_needs_work system_ext
+}
+
+marker_path_for_partition() {
+    case "$1" in
+        system) printf '%s' "/system/$MARKER_REL" ;;
+        system_ext) printf '%s' "/system_ext/$MARKER_REL" ;;
+        *) return 1 ;;
+    esac
+}
+
+staged_marker_path_for_partition() {
+    root="$1"
+    part="$2"
+    printf '%s/%s' "$root" "$MARKER_REL"
+}
+
+marker_matches_package() {
+    file="$1"
+    [ -f "$file" ] || return 1
+    grep -q "^package_id=$PACKAGE_ID$" "$file" 2>/dev/null
+}
+
+classify_target_file() {
+    t="$1"
+    path="$2"
+    source="$3"
+    part="$(target_partition "$t")" || abort "Invalid target partition: $t"
+
+    ui_print "- Resolved current target:"
+    ui_print "  logical=/$t"
+    ui_print "  actual=$path"
+    ui_print "  source=$source"
+
+    got="$(hash_file "$path")"
+    original="$(required_hash "$t" original_sha256)"
+    patched="$(required_hash "$t" patched_sha256)"
+    if [ "$got" = "$original" ]; then
+        plan_add_need "$part"
+        ui_print "  state: original stock, needs replacement"
+    elif [ "$got" = "$patched" ]; then
+        plan_add_patched "$part"
+        ui_print "  state: already patched"
+    else
+        ui_print "  state: unknown current hash"
+        ui_print "  current: $got"
+        ui_print "  original: $original"
+        ui_print "  patched: $patched"
+        abort "Unknown current hash for $path"
+    fi
+}
+
+classify_target_from_mounted_block() {
+    t="$1"
+    part="$(target_partition "$t")" || return 1
+    mount_partition_ro_for_classification "$part" || return 1
+    root="$(classification_root_for_partition "$part")"
+    block="$(classification_block_for_partition "$part")" || return 1
+    mount_point="$(classification_mountpoint_for_partition "$part")" || return 1
+    ui_print "  mapper block: $block"
+    ui_print "  mount point: $mount_point"
+    ui_print "  detected root: $root"
+    rel="$(target_fs_path "$t")"
+    path="$root/$rel"
+    [ -f "$path" ] || return 1
+    classify_target_file "$t" "$path" "manual mapped-block read-only mount"
+    return 0
+}
+
+detect_reflash_marker() {
+    STEP="detect reflash marker"
+    REFLASH_MARKER_PRESENT=false
+    SYSTEM_MARKER_PATH="$(marker_path_for_partition system)"
+    SYSTEM_EXT_MARKER_PATH="$(marker_path_for_partition system_ext)"
+    ui_print " "
+    ui_print "Reflash marker check:"
+    for marker in "$SYSTEM_MARKER_PATH" "$SYSTEM_EXT_MARKER_PATH"; do
+        if marker_matches_package "$marker"; then
+            REFLASH_MARKER_PRESENT=true
+            ui_print "- $marker: package marker present"
+        elif [ -f "$marker" ]; then
+            ui_print "- $marker: marker path exists but package_id does not match"
+        else
+            ui_print "- $marker: not present"
+        fi
+    done
+}
+
+classify_current_targets() {
+    STEP="classify current target files"
+    SYSTEM_NEEDS_REPLACE_COUNT=0
+    SYSTEM_ALREADY_PATCHED_COUNT=0
+    SYSTEM_EXT_NEEDS_REPLACE_COUNT=0
+    SYSTEM_EXT_ALREADY_PATCHED_COUNT=0
+
+    ui_print " "
+    ui_print "Current target state:"
+    for t in $TARGETS; do
+        if classify_target_from_mounted_block "$t"; then
+            :
+        elif classify_target_from_erofs_staging "$t"; then
+            :
+        else
+            mounted="$(resolve_mounted_target "$t")"
+            if [ -n "$mounted" ]; then
+                classify_target_file "$t" "$mounted" "recovery-mounted fallback"
+            else
+                ui_print "- Unresolved current target:"
+                ui_print "  logical=/$t"
+                ui_print "  mapped-block manual mount failed"
+                ui_print "  extracted-staging fallback failed"
+                ui_print "  recovery-mounted fallback failed"
+                abort "Current target missing after all candidates: /$t"
+            fi
+        fi
+    done
+}
+
+print_partition_plan() {
+    part="$1"
+    needs="$(partition_needs_replace_count "$part")"
+    patched="$(partition_already_patched_count "$part")"
+    total="$(partition_target_count "$part")"
+    if [ "$needs" = "0" ]; then
+        if [ "$patched" = "$total" ]; then
+            ui_print "- $part: skip, all targets already patched"
+        else
+            ui_print "- $part: skip, no targets need replacement"
+        fi
+    else
+        ui_print "- $part: patch, $needs target needs replacement"
+    fi
+}
+
+print_install_plan() {
+    STEP="print install plan"
+    PLANNED_PARTITIONS=""
+    partition_needs_work system && PLANNED_PARTITIONS="system"
+    if partition_needs_work system_ext; then
+        [ -n "$PLANNED_PARTITIONS" ] && PLANNED_PARTITIONS="$PLANNED_PARTITIONS,system_ext" || PLANNED_PARTITIONS="system_ext"
+    fi
+    ui_print " "
+    ui_print "Install plan:"
+    print_partition_plan system
+    print_partition_plan system_ext
+    ui_print "- reflash marker present: $REFLASH_MARKER_PRESENT"
+}
+
+target_patch_flag() {
+    case "$1" in
+        system/framework/framework.jar) printf '%s' "framework_patch=true" ;;
+        system/lib64/libandroid_runtime.so) printf '%s' "libandroid_runtime_patch=true" ;;
+        system/lib/libandroid_runtime.so) printf '%s' "libandroid_runtime_patch=true" ;;
+        system_ext/framework/mediatek-services.jar) printf '%s' "mediatek_services_patch=true" ;;
+    esac
+}
+
+write_partition_marker() {
+    root="$1"
+    part="$2"
+    marker="$(staged_marker_path_for_partition "$root" "$part")"
+    mkdir -p "$(dirname "$marker")" || abort "Failed creating marker directory for $part"
+    applied="$PLANNED_PARTITIONS"
+    [ -n "$applied" ] || applied="$part"
+    framework_patch=false
+    libandroid_runtime_patch=false
+    mediatek_services_patch=false
+    for t in $(targets_for_partition "$part"); do
+        case "$(target_patch_flag "$t")" in
+            framework_patch=true) framework_patch=true ;;
+            libandroid_runtime_patch=true) libandroid_runtime_patch=true ;;
+            mediatek_services_patch=true) mediatek_services_patch=true ;;
+        esac
+    done
+    {
+        echo "package_id=$PACKAGE_ID"
+        echo "version=1"
+        echo "applied_slot=${SLOT:-}"
+        echo "applied_partitions=$applied"
+        echo "framework_patch=$framework_patch"
+        echo "libandroid_runtime_patch=$libandroid_runtime_patch"
+        echo "mediatek_services_patch=$mediatek_services_patch"
+        echo "framework_sha256=$(required_hash system/framework/framework.jar patched_sha256)"
+        echo "libandroid_runtime_64_sha256=$(required_hash system/lib64/libandroid_runtime.so patched_sha256)"
+        echo "libandroid_runtime_32_sha256=$(required_hash system/lib/libandroid_runtime.so patched_sha256)"
+        echo "mediatek_services_sha256=$(required_hash system_ext/framework/mediatek-services.jar patched_sha256)"
+    } > "$marker" || abort "Failed writing marker for $part"
+    chown 0:0 "$marker" 2>/dev/null || true
+    chmod 0644 "$marker" || abort "Failed chmod marker for $part"
+    [ -n "$CHCON" ] && [ -x "$CHCON" ] && "$CHCON" u:object_r:system_file:s0 "$marker" 2>/dev/null
+    ui_print "- Wrote marker: /$part/$MARKER_REL"
+}
+
+deletes_for_partition() {
+    part="$1"
+    for t in $DELETE_TARGETS; do
+        [ "$(target_partition "$t")" = "$part" ] && printf '%s\n' "$t"
+    done
+}
+
+validate_originals_in_tree() {
+    root="$1"
+    part="$2"
+    STEP="validate $part original hashes"
+    for t in $(targets_for_partition "$part"); do
+        rel="$(target_fs_path "$t")"
+        f="$root/$rel"
+        [ -f "$f" ] || abort "Original target missing: $t"
+        expected="$(required_hash "$t" original_sha256)"
+        patched="$(required_hash "$t" patched_sha256)"
+        got="$(hash_file "$f")"
+        [ "$got" = "$expected" ] || [ "$got" = "$patched" ] || abort "Original hash mismatch for $t"
+    done
+}
+
+replace_payloads_in_tree() {
+    root="$1"
+    part="$2"
+    STEP="replace $part patched files"
+    for t in $(targets_for_partition "$part"); do
+        src="$PAYLOAD_DIR/payload/$t"
+        [ -f "$src" ] || src="$PAYLOAD_DIR/$t"
+        rel="$(target_fs_path "$t")"
+        dst="$root/$rel"
+        [ -f "$src" ] || abort "Payload missing after extraction: $t"
+        old_uid="$(stat -c %u "$dst" 2>/dev/null || echo 0)"
+        old_gid="$(stat -c %g "$dst" 2>/dev/null || echo 0)"
+        old_mode="$(stat -c %a "$dst" 2>/dev/null || echo 0644)"
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst" || abort "Failed copying $t"
+        chown "$old_uid:$old_gid" "$dst" 2>/dev/null || true
+        chmod "$old_mode" "$dst" || abort "Failed chmod for $t"
+        [ -n "$CHCON" ] && [ -x "$CHCON" ] && "$CHCON" u:object_r:system_file:s0 "$dst" 2>/dev/null
+    done
+}
+
+delete_stale_artifacts_in_tree() {
+    root="$1"
+    part="$2"
+    STEP="delete stale $part artifacts"
+    for t in $(deletes_for_partition "$part"); do
+        is_allowed_delete "$t" || abort "Unapproved delete target: $t"
+        rel="$(target_fs_path "$t")"
+        if [ -e "$root/$rel" ]; then
+            rm -f "$root/$rel" || abort "Failed deleting $t"
+            ui_print "- Deleted stale artifact: /$t"
+        fi
+    done
+}
+
+validate_patched_in_tree() {
+    root="$1"
+    part="$2"
+    STEP="validate $part patched hashes"
+    for t in $(targets_for_partition "$part"); do
+        rel="$(target_fs_path "$t")"
+        f="$root/$rel"
+        expected="$(required_hash "$t" patched_sha256)"
+        got="$(hash_file "$f")"
+        [ "$got" = "$expected" ] || abort "Patched hash mismatch for $t"
+    done
+}
+
+align_up() {
+    value="$1"
+    alignment="$2"
+    printf '%s' $(( ((value + alignment - 1) / alignment) * alignment ))
+}
+
+free_bytes_on_mount() {
+    df -k "$1" 2>/dev/null | awk 'NR==2 { print $4 * 1024 }'
+}
+
+required_extra_bytes_for_partition() {
+    root="$1"
+    part="$2"
+    total=0
+    for t in $(targets_for_partition "$part"); do
+        rel="$(target_fs_path "$t")"
+        dst="$root/$rel"
+        src="$PAYLOAD_DIR/payload/$t"
+        [ -f "$src" ] || src="$PAYLOAD_DIR/$t"
+        [ -f "$dst" ] || continue
+        [ -f "$src" ] || continue
+        dst_size="$(wc -c < "$dst" 2>/dev/null)"
+        src_size="$(wc -c < "$src" 2>/dev/null)"
+        case "$dst_size" in *[!0-9]*|"") continue ;; esac
+        case "$src_size" in *[!0-9]*|"") continue ;; esac
+        if [ "$src_size" -gt "$dst_size" ]; then
+            total=$((total + src_size - dst_size))
+        fi
+    done
+    printf '%s' "$total"
+}
+
+grow_logical_partition_with_lptools() {
+    part="$1"
+    required_extra="$2"
+    case "$part" in
+        system) lp_part="$SYSTEM_PART"; current_size="$SYSTEM_SIZE" ;;
+        system_ext) lp_part="$SYSTEM_EXT_PART"; current_size="$SYSTEM_EXT_SIZE" ;;
+        *) abort "Internal partition resize error: $part" ;;
+    esac
+    [ "$(manifest_bool allow_resize)" = "true" ] || abort "Replacement needs $required_extra more bytes but manifest allow_resize is not true"
+    [ -n "$LPTOOLS" ] && [ -x "$LPTOOLS" ] || abort "lptools required for logical partition resize"
+
+    alignment="$(manifest_uint_default dynamic_partition_alignment_bytes 1048576)"
+    margin="$(manifest_uint_default resize_safety_margin_bytes 67108864)"
+    growth="$(align_up $((required_extra + margin)) "$alignment")"
+    target_size="$(align_up $((current_size + growth)) "$alignment")"
+
+    ui_print "- Logical resize needed for $part"
+    ui_print "  required extra: $required_extra bytes"
+    ui_print "  safety margin : $margin bytes"
+    ui_print "  target size   : $target_size bytes"
+    "$LPTOOLS" resize "$lp_part" "$target_size" > "$WORK/lptools-resize-$part.txt" 2>&1 || {
+        print_log_tail "$WORK/lptools-resize-$part.txt"
+        abort "lptools resize failed for $lp_part"
+    }
+    case "$part" in
+        system) SYSTEM_SIZE="$target_size" ;;
+        system_ext) SYSTEM_EXT_SIZE="$target_size" ;;
+    esac
+}
+
+resize_logical_partition_to_size() {
+    part="$1"
+    target_size="$2"
+    case "$part" in
+        system) lp_part="$SYSTEM_PART" ;;
+        system_ext) lp_part="$SYSTEM_EXT_PART" ;;
+        *) abort "Internal partition resize error: $part" ;;
+    esac
+    [ -n "$LPTOOLS" ] && [ -x "$LPTOOLS" ] || abort "lptools required for logical partition resize"
+
+    ui_print "- Resizing logical partition for $part"
+    ui_print "  logical partition: $lp_part"
+    ui_print "  target size      : $target_size bytes"
+    run_logged "lptools-resize-${part}" "$LPTOOLS" resize "$lp_part" "$target_size" || abort "lptools resize failed for $lp_part"
+    [ -n "$LPTOOLS" ] && "$LPTOOLS" map "$lp_part" >/dev/null 2>&1 || true
+
+    case "$part" in
+        system) SYSTEM_SIZE="$target_size" ;;
+        system_ext) SYSTEM_EXT_SIZE="$target_size" ;;
+    esac
+}
+
+ensure_erofs_image_fits_mapper() {
+    part="$1"
+    source_size="$2"
+    image="$3"
+    block="$4"
+    fallback_size="$5"
+
+    check_image_size_report "$part" "$source_size" "$image" "$block" "$fallback_size"
+    rc="$?"
+    [ "$rc" = "0" ] && return 0
+    [ "$rc" = "2" ] || return "$rc"
+
+    image_size="$(size_value_or_file "$image")"
+    ui_print "- $part rebuilt image does not fit current mapper; resizing logical partition with lptools"
+    resize_logical_partition_to_size "$part" "$image_size"
+    SIZE_WARNINGS="$(append_unique_word "$SIZE_WARNINGS" "$part")"
+    NOT_FLASHABLE_OVERSIZE="$(remove_word "$NOT_FLASHABLE_OVERSIZE" "$part")"
+
+    check_image_size_report "$part" "$source_size" "$image" "$block" "$image_size"
+    rc="$?"
+    if [ "$rc" = "2" ]; then
+        ui_print "ERROR: $part image still does not fit after lptools resize"
+        return 2
+    fi
+
+    ui_print "- $part mapper is large enough after lptools resize"
+    return "$rc"
+}
+
+ensure_ext4_free_space() {
+    part="$1"
+    block="$2"
+    mount_point="$3"
+    extra="$(required_extra_bytes_for_partition "$mount_point" "$part")"
+    free="$(free_bytes_on_mount "$mount_point")"
+    case "$extra" in *[!0-9]*|"") return 0 ;; esac
+    case "$free" in *[!0-9]*|"") return 0 ;; esac
+    [ "$extra" -le "$free" ] && return 0
+
+    shortage=$((extra - free))
+    ui_print "- $part ext4 free space is insufficient"
+    ui_print "  required growth: $extra bytes"
+    ui_print "  free space     : $free bytes"
+    ui_print "  shortage       : $shortage bytes"
+    unmount_or_abort "$mount_point" "$part ext4 rw mount before resize"
+    grow_logical_partition_with_lptools "$part" "$shortage"
+    if [ -n "$RESIZE2FS" ] && [ -x "$RESIZE2FS" ]; then
+        ui_print "- Running resize2fs on resized $part"
+        "$RESIZE2FS" "$block" 2>&1 | while read line; do ui_print "  $line"; done
+    fi
+    mount_ext4_rw "$block" "$mount_point"
+}
+
+mount_ext4_rw() {
+    block="$1"
+    mount_point="$2"
+    mkdir -p "$mount_point"
+    ui_print "- Manual rw mount for ext4 patching"
+    ui_print "  mapped block: $block"
+    ui_print "  command: mount -t ext4 -o rw $block $mount_point"
+    mount -t ext4 -o rw "$block" "$mount_point" 2>/dev/null || mount -o rw "$block" "$mount_point" 2>/dev/null || abort "Unable to mount ext4 rw: $block"
+}
+
+install_ext4_partition() {
+    part="$1"
+    block="$2"
+    mountvar="$3"
+    STEP="install $part ext4"
+    if [ -n "$RESIZE2FS" ] && [ -x "$RESIZE2FS" ]; then
+        ui_print "- Running resize2fs on $part"
+        "$RESIZE2FS" "$block" 2>&1 | while read line; do ui_print "  $line"; done
+    fi
+    mount_point="$WORK/mnt-$part"
+    eval "$mountvar=\"$mount_point\""
+    mount_ext4_rw "$block" "$mount_point"
+    validate_originals_in_tree "$mount_point" "$part"
+    ensure_ext4_free_space "$part" "$block" "$mount_point"
+    replace_payloads_in_tree "$mount_point" "$part"
+    delete_stale_artifacts_in_tree "$mount_point" "$part"
+    write_partition_marker "$mount_point" "$part"
+    sync
+    validate_patched_in_tree "$mount_point" "$part"
+    unmount_or_abort "$mount_point" "$part ext4 rw mount"
+    eval "$mountvar=\"\""
+    [ -n "$E2FSCK" ] && [ -x "$E2FSCK" ] && "$E2FSCK" -fy "$block" 2>&1 | while read line; do ui_print "  $line"; done
+}
+
+select_extracted_root() {
+    outdir="$1"
+    part="$2"
+    case "$part" in
+        system)
+            for root in "$outdir/system" "$outdir" "$outdir/system/system" "$outdir/new-system/system" "$outdir/new-system"; do
+                if [ -f "$root/framework/framework.jar" ]; then
+                    SYSTEM_SRC_ROOT="$root"
+                    EROFS_VALID_ROOT="$root"
+                    ui_print "- Extracted root selected for system: $root"
+                    return 0
+                fi
+            done
+            ;;
+        system_ext)
+            for root in "$outdir/system_ext" "$outdir" "$outdir/system/system_ext" "$outdir/new-system_ext/system_ext" "$outdir/new-system_ext"; do
+                if [ -f "$root/framework/mediatek-services.jar" ]; then
+                    SYSTEM_EXT_SRC_ROOT="$root"
+                    EROFS_VALID_ROOT="$root"
+                    ui_print "- Extracted root selected for system_ext: $root"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+select_erofs_image_root() {
+    outdir="$1"
+    part="$2"
+    case "$part" in
+        system)
+            for root in "$outdir/system" "$outdir/new-system" "$outdir"; do
+                if [ -d "$root" ] && { [ -d "$root/system" ] || [ -f "$root/framework/framework.jar" ]; }; then
+                    echo "$root"
+                    return 0
+                fi
+            done
+            ;;
+        system_ext)
+            for root in "$outdir/system_ext" "$outdir/new-system_ext" "$outdir"; do
+                if [ -d "$root" ] && [ -d "$root/framework" ]; then
+                    echo "$root"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+select_mounted_image_root() {
+    part="$1"
+    mount_point="$2"
+    target_root="$3"
+    case "$part" in
+        system)
+            for root in "$mount_point/system" "$mount_point" "$target_root"; do
+                if [ -d "$root" ] && { [ -d "$root/system" ] || [ -f "$root/framework/framework.jar" ]; }; then
+                    echo "$root"
+                    return 0
+                fi
+            done
+            ;;
+        system_ext)
+            for root in "$mount_point/system_ext" "$target_root" "$mount_point"; do
+                if [ -d "$root" ] && [ -d "$root/framework" ]; then
+                    echo "$root"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 1
+}
+
+align_stock_image_root() {
+    stock_target_root="$1"
+    image_root="$2"
+    target_root="$3"
+    target_rel="${target_root#$image_root}"
+    target_rel="${target_rel#/}"
+    if [ -z "$target_rel" ] || [ "$target_rel" = "$target_root" ]; then
+        echo "$stock_target_root"
+        return 0
+    fi
+    case "$stock_target_root" in
+        */"$target_rel")
+            echo "${stock_target_root%/$target_rel}"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+erofs_stock_uuid() {
+    image="$1"
+    log="$WORK/erofs-stock-uuid.log"
+    : >"$log" 2>/dev/null || true
+
+    if [ -n "$DUMP_EROFS" ] && [ -x "$DUMP_EROFS" ]; then
+        "$DUMP_EROFS" -s "$image" >>"$log" 2>&1 || true
+        "$DUMP_EROFS" "$image" >>"$log" 2>&1 || true
+    fi
+
+    if [ -n "$FSCK_EROFS" ] && [ -x "$FSCK_EROFS" ]; then
+        "$FSCK_EROFS" "$image" >>"$log" 2>&1 || true
+    fi
+
+    if command -v strings >/dev/null 2>&1; then
+        strings "$image" 2>/dev/null | grep -i 'uuid' >>"$log" 2>&1 || true
+    fi
+
+    awk -F: '/Filesystem UUID|UUID/ {
+        v=$2
+        sub(/^[ \t]*/, "", v)
+        sub(/[ \t]*$/, "", v)
+        if (v ~ /^[0-9a-fA-F-][0-9a-fA-F-]*$/) {
+            print v
+            exit
+        }
+    }' "$log"
+}
+
+stock_selinux_label() {
+    path="$1"
+    label=""
+    label="$(ls -Zd "$path" 2>/dev/null | awk '{print $1}')" || label=""
+    case "$label" in
+        u:object_r:*:*) printf '%s' "$label"; return 0 ;;
+    esac
+    return 1
+}
+
+prepare_erofs_metadata_from_stock() {
+    part="$1"
+    stock_root="$2"
+    image_root="$3"
+    fs_config="$4"
+    file_contexts="$5"
+    STEP="prepare $part erofs metadata"
+
+    : >"$fs_config" || abort "Failed creating fs_config for $part"
+    : >"$file_contexts" || abort "Failed creating file_contexts for $part"
+    config_dir="$(dirname "$image_root")/config"
+    extracted_fs_config="$config_dir/${part}_fs_config"
+    extracted_file_contexts="$config_dir/${part}_file_contexts"
+    if [ -s "$extracted_fs_config" ]; then
+        cp "$extracted_fs_config" "$fs_config" || abort "Failed copying stock fs_config for $part"
+        if [ -s "$extracted_file_contexts" ]; then
+            cp "$extracted_file_contexts" "$file_contexts" || abort "Failed copying stock file_contexts for $part"
+        fi
+        fs_lines="$(wc -l < "$fs_config" 2>/dev/null | tr -d ' ')"
+        fc_lines="$(wc -l < "$file_contexts" 2>/dev/null | tr -d ' ')"
+        ui_print "- Using extracted stock metadata for $part: fs_config=$fs_lines file_contexts=$fc_lines"
+        return 0
+    fi
+
+    ui_print "- Preparing stock metadata for $part"
+    ui_print "  stock image root: $stock_root"
+    ui_print "  extracted image root: $image_root"
+    ui_print "  fs_config: $fs_config"
+    ui_print "  file_contexts: $file_contexts"
+
+    (
+        cd "$stock_root" || exit 1
+        find . -xdev 2>/dev/null
+    ) | while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        rel="${rel#./}"
+        [ "$rel" = "." ] && rel=""
+        stock_path="$stock_root"
+        image_path="$image_root"
+        if [ -n "$rel" ]; then
+            stock_path="$stock_root/$rel"
+            image_path="$image_root/$rel"
+        fi
+        [ -e "$image_path" ] || [ -L "$image_path" ] || continue
+
+        uid="$(stat -c %u "$stock_path" 2>/dev/null || echo 0)"
+        gid="$(stat -c %g "$stock_path" 2>/dev/null || echo 0)"
+        mode="$(stat -c %a "$stock_path" 2>/dev/null || echo 0755)"
+        if [ -L "$stock_path" ]; then
+            mode=0755
+            chown -h "$uid:$gid" "$image_path" 2>/dev/null || chown "$uid:$gid" "$image_path" 2>/dev/null || true
+        else
+            chown "$uid:$gid" "$image_path" 2>/dev/null || true
+            chmod "$mode" "$image_path" 2>/dev/null || true
+        fi
+
+        cfg_path="$(config_path_for_mkfs "$part" "$rel")" || continue
+        printf '%s %s %s 0%s\n' "$cfg_path" "$uid" "$gid" "$mode" >>"$fs_config"
+
+        label="$(stock_selinux_label "$stock_path" 2>/dev/null || true)"
+        if [ -n "$label" ]; then
+            regex_path="/$cfg_path"
+            regex_path="$(escape_file_context_path "$regex_path")"
+            printf '%s %s\n' "$regex_path" "$label" >>"$file_contexts"
+        fi
+    done
+
+    fs_lines="$(wc -l < "$fs_config" 2>/dev/null | tr -d ' ')"
+    fc_lines="$(wc -l < "$file_contexts" 2>/dev/null | tr -d ' ')"
+    ui_print "- Metadata entries for $part: fs_config=$fs_lines file_contexts=$fc_lines"
+    [ "$fs_lines" != "0" ] || abort "No fs_config entries generated for $part"
+    [ "$fc_lines" != "0" ] || ui_print "WARNING: no SELinux file_contexts entries generated for $part"
+}
+
+run_mkfs_erofs_with_metadata() {
+    part="$1"
+    out="$2"
+    image_root="$3"
+    compression="$4"
+    stock_uuid="$5"
+    fs_config="$6"
+    file_contexts="$7"
+    mount_point="$(mkfs_mount_point_for_partition "$part")" || abort "No mkfs mount point for $part"
+    fixed_time="1230768000"
+
+    ui_print "- mkfs image root: $image_root"
+    ui_print "- mkfs output image: $out"
+    ui_print "- mkfs mount point: $mount_point"
+    ui_print "- mkfs fixed timestamp: $fixed_time"
+    ui_print "- mkfs stock UUID: ${stock_uuid:-<none>}"
+    ui_print "- mkfs fs_config: ${fs_config:-<none>}"
+    ui_print "- mkfs file_contexts: ${file_contexts:-<none>}"
+
+    [ -d "$image_root" ] || abort "mkfs image root missing: $image_root"
+    [ -n "$out" ] || abort "mkfs output image path empty"
+    [ -n "$compression" ] || abort "mkfs compression empty"
+
+    mkfs_args="-z $compression"
+    if [ -n "$fixed_time" ]; then
+        mkfs_args="$mkfs_args -T $fixed_time"
+    else
+        ui_print "WARNING: fixed timestamp empty; omitting -T"
+    fi
+
+    if [ -n "$stock_uuid" ]; then
+        mkfs_args="$mkfs_args -U $stock_uuid"
+    else
+        ui_print "WARNING: stock UUID unavailable; omitting -U"
+    fi
+
+    if [ -n "$mount_point" ]; then
+        mkfs_args="$mkfs_args --mount-point $mount_point"
+    else
+        ui_print "WARNING: mount point empty; omitting --mount-point"
+    fi
+
+    if [ -n "$fs_config" ] && [ -s "$fs_config" ]; then
+        mkfs_args="$mkfs_args --fs-config-file $fs_config"
+    else
+        ui_print "WARNING: fs_config missing or empty; omitting --fs-config-file"
+    fi
+
+    if [ -n "$file_contexts" ] && [ -s "$file_contexts" ]; then
+        mkfs_args="$mkfs_args --file-contexts $file_contexts"
+    else
+        ui_print "WARNING: file_contexts missing or empty; omitting --file-contexts"
+    fi
+
+    STEP="repack $part erofs"
+    run_logged "mkfs-erofs-${part}" "$MKFS_EROFS" $mkfs_args "$out" "$image_root" || abort "mkfs.erofs failed for $part"
+}
+
+print_log_head() {
+    file="$1"
+    [ -f "$file" ] || return
+    sed -n '1,120p' "$file" | while IFS= read -r line; do
+        clean="$(printf '%s' "$line" | tr -cd '[:print:]\t ')"
+        ui_print "$clean"
+    done
+}
+
+run_erofs_extract_attempt() {
+    label="$1"
+    log="$2"
+    outdir="$3"
+    shift 3
+    rm -rf "$outdir"
+    mkdir -p "$outdir"
+    ui_print "- Trying EROFS extraction: $label"
+    rm -f "$log"
+    "$@" >"$log" 2>&1
+    rc="$?"
+    if [ "$rc" = "0" ]; then
+        ui_print "- EROFS extraction command succeeded: $label"
+        return 0
+    fi
+    ui_print "- EROFS extraction command failed: $label (rc=$rc)"
+    ui_print "  log: $log"
+    print_log_tail "$log"
+    return 1
+}
+
+validate_erofs_extraction() {
+    outdir="$1"
+    part="$2"
+    entry_count="$(find "$outdir" -mindepth 1 -maxdepth 3 2>/dev/null | wc -l)"
+    if [ "$entry_count" = "0" ]; then
+        ui_print "- extractor produced empty output; treating as failure"
+        return 1
+    fi
+    select_extracted_root "$outdir" "$part" && return 0
+    ui_print "- EROFS extraction output validation failed for $part"
+    ui_print "  output dir: $outdir"
+    ui_print "  probed roots:"
+    case "$part" in
+        system)
+            ui_print "    $outdir/system"
+            ui_print "    $outdir"
+            ui_print "    $outdir/system/system"
+            ;;
+        system_ext)
+            ui_print "    $outdir/system_ext"
+            ui_print "    $outdir"
+            ui_print "    $outdir/system/system_ext"
+            ;;
+    esac
+    ui_print "  top-level entries:"
+    ui_print "  entry count: $entry_count"
+    find "$outdir" -maxdepth 3 -type f 2>/dev/null | sed -n '1,40p' | while read line; do ui_print "    $line"; done
+    return 1
+}
+
+extract_erofs_image() {
+    image="$1"
+    outdir="$2"
+    part="$3"
+    STEP="extract $part erofs"
+    [ -n "$EXTRACT_EROFS" ] && [ -x "$EXTRACT_EROFS" ] || abort "extract.erofs required for EROFS"
+
+    ui_print "- EROFS extraction diagnostics for $part"
+    ui_print "  extract.erofs path: $EXTRACT_EROFS"
+    ls -l "$EXTRACT_EROFS" 2>&1 | while read line; do ui_print "  ls: $line"; done
+    chmod 755 "$EXTRACT_EROFS" 2>&1 | while read line; do ui_print "  chmod: $line"; done
+    help_log="$WORK/$part-extract-erofs-help.log"
+    "$EXTRACT_EROFS" --help >"$help_log" 2>&1 || true
+    ui_print "  extract.erofs --help:"
+    print_log_head "$help_log"
+    help_h_log="$WORK/$part-extract-erofs-h.log"
+    "$EXTRACT_EROFS" -h >"$help_h_log" 2>&1 || true
+    ui_print "  extract.erofs -h:"
+    print_log_head "$help_h_log"
+    if [ -n "$FILE" ] && [ -x "$FILE" ]; then
+        file_log="$WORK/$part-extract-erofs-file.log"
+        "$FILE" "$EXTRACT_EROFS" >"$file_log" 2>&1 || true
+        print_log_tail "$file_log"
+    fi
+    if command -v ldd >/dev/null 2>&1; then
+        ldd_log="$WORK/$part-extract-erofs-ldd.log"
+        ldd "$EXTRACT_EROFS" >"$ldd_log" 2>&1 || true
+        print_log_tail "$ldd_log"
+    fi
+    ui_print "  image path: $image"
+    ui_print "  image size: $(wc -c < "$image" 2>/dev/null) bytes"
+    ui_print "  output dir: $outdir"
+    df -k "$WORK" "$outdir" 2>&1 | while read line; do ui_print "  df: $line"; done
+
+    combined_help="$WORK/$part-erofs-help-combined.log"
+    {
+        sed -n '1,200p' "$help_log" 2>/dev/null
+        sed -n '1,200p' "$help_h_log" 2>/dev/null
+    } >"$combined_help"
+
+    extract_log="$WORK/$part-extract-erofs.log"
+    if grep -Eq -- '(-i, --image|--image=)' "$combined_help" && grep -Eq -- '(-x|Extract all items)' "$combined_help" && grep -Eq -- '(-o, --outdir|--outdir=)' "$combined_help"; then
+        run_erofs_extract_attempt "extract.erofs -i IMAGE -x -o OUTDIR" "$extract_log" "$outdir" "$EXTRACT_EROFS" -i "$image" -x -o "$outdir" && validate_erofs_extraction "$outdir" "$part" && { EROFS_EXTRACT_ROOT="$EROFS_VALID_ROOT"; return 0; }
+    else
+        ui_print "- extract.erofs help does not advertise required -i/-x/-o extraction form"
+    fi
+    if [ -n "$FSCK_EROFS" ] && [ -x "$FSCK_EROFS" ]; then
+        fsck_help="$WORK/$part-fsck-erofs-help.log"
+        "$FSCK_EROFS" --help >"$fsck_help" 2>&1 || "$FSCK_EROFS" -h >"$fsck_help" 2>&1 || true
+        if grep -Eiq -- 'extract' "$fsck_help"; then
+            run_erofs_extract_attempt "fsck.erofs --extract=OUTDIR IMAGE" "$extract_log" "$outdir" "$FSCK_EROFS" "--extract=$outdir" "$image" && validate_erofs_extraction "$outdir" "$part" && { EROFS_EXTRACT_ROOT="$EROFS_VALID_ROOT"; return 0; }
+            run_erofs_extract_attempt "fsck.erofs --extract OUTDIR IMAGE" "$extract_log" "$outdir" "$FSCK_EROFS" --extract "$outdir" "$image" && validate_erofs_extraction "$outdir" "$part" && { EROFS_EXTRACT_ROOT="$EROFS_VALID_ROOT"; return 0; }
+        fi
+    fi
+    if [ -n "$DUMP_EROFS" ] && [ -x "$DUMP_EROFS" ]; then
+        dump_help="$WORK/$part-dump-erofs-help.log"
+        "$DUMP_EROFS" --help >"$dump_help" 2>&1 || "$DUMP_EROFS" -h >"$dump_help" 2>&1 || true
+        if grep -Eiq -- 'extract' "$dump_help"; then
+            run_erofs_extract_attempt "dump.erofs --extract=OUTDIR IMAGE" "$extract_log" "$outdir" "$DUMP_EROFS" "--extract=$outdir" "$image" && validate_erofs_extraction "$outdir" "$part" && { EROFS_EXTRACT_ROOT="$EROFS_VALID_ROOT"; return 0; }
+            run_erofs_extract_attempt "dump.erofs --extract OUTDIR IMAGE" "$extract_log" "$outdir" "$DUMP_EROFS" --extract "$outdir" "$image" && validate_erofs_extraction "$outdir" "$part" && { EROFS_EXTRACT_ROOT="$EROFS_VALID_ROOT"; return 0; }
+        fi
+    fi
+
+    ui_print "EROFS extraction failed or produced invalid output; last log:"
+    print_log_head "$extract_log"
+    abort "$part EROFS extraction failed after all methods"
+}
+
+erofs_staging_root_for_partition() {
+    case "$1" in
+        system) printf '%s' "$SYSTEM_SRC_ROOT" ;;
+        system_ext) printf '%s' "$SYSTEM_EXT_SRC_ROOT" ;;
+    esac
+}
+
+ensure_erofs_classification_root() {
+    part="$1"
+    case "$part" in
+        system)
+            fs="$SYSTEM_FS"
+            block="$SYSTEM_BLOCK"
+            ;;
+        system_ext)
+            fs="$SYSTEM_EXT_FS"
+            block="$SYSTEM_EXT_BLOCK"
+            ;;
+        *) return 1 ;;
+    esac
+    [ "$fs" = "erofs" ] || return 1
+
+    existing="$(erofs_staging_root_for_partition "$part")"
+    if [ -n "$existing" ] && [ -d "$existing" ]; then
+        return 0
+    fi
+
+    STEP="classify current target files"
+    check_workdir_space "$HEAVY_WORKDIR" "$part EROFS classification"
+    img="$HEAVY_WORKDIR/$part.classify.img"
+    outdir="$HEAVY_WORKDIR/$part-erofs-src"
+    mkdir -p "$outdir"
+    ui_print "- Mounted target unresolved; extracting $part EROFS for classification"
+    run_logged "dd-${part}-classify-image" "$DD" if="$block" of="$img" bs=1048576
+    extract_erofs_image "$img" "$outdir" "$part"
+    ui_print "- Removed temporary classification image: $img"
+    rm -f "$img"
+}
+
+classify_target_from_erofs_staging() {
+    t="$1"
+    part="$(target_partition "$t")" || return 1
+    ensure_erofs_classification_root "$part" || return 1
+    root="$(erofs_staging_root_for_partition "$part")"
+    rel="$(target_fs_path "$t")"
+    path="$root/$rel"
+    [ -f "$path" ] || return 1
+    classify_target_file "$t" "$path" "extracted EROFS staging"
+    return 0
+}
+
+install_erofs_partition() {
+    part="$1"
+    block="$2"
+    size="$3"
+    STEP="install $part erofs"
+    [ -n "$EXTRACT_EROFS" ] && [ -x "$EXTRACT_EROFS" ] || abort "extract.erofs required for EROFS"
+    [ -n "$MKFS_EROFS" ] && [ -x "$MKFS_EROFS" ] || abort "mkfs.erofs required for EROFS"
+    check_workdir_space "$HEAVY_WORKDIR" "$part EROFS work"
+    img="$HEAVY_WORKDIR/$part.img"
+    extracted="$HEAVY_WORKDIR/$part-erofs-src"
+    out="$HEAVY_WORKDIR/new-$part.img"
+    mkdir -p "$extracted"
+    ui_print "- Dumping $part partition"
+    run_logged "dd-${part}-source-image" "$DD" if="$block" of="$img" bs=1048576
+    source_size="$(wc -c < "$img" 2>/dev/null)"
+    [ -n "$source_size" ] || source_size="$size"
+    ui_print "- df before extraction:"
+    df "$HEAVY_WORKDIR" 2>&1 | while read line; do ui_print "  $line"; done
+    ui_print "- Extracting $part EROFS"
+    extract_erofs_image "$img" "$extracted" "$part"
+    target_root="$EROFS_EXTRACT_ROOT"
+    image_root="$(select_erofs_image_root "$extracted" "$part")" || abort "Failed selecting $part EROFS image root"
+    mount_partition_ro_for_classification "$part" || abort "Failed mounting stock $part for metadata harvest"
+    stock_target_root="$(classification_root_for_partition "$part")"
+    stock_mount_point="$(classification_mountpoint_for_partition "$part")"
+    stock_image_root="$(align_stock_image_root "$stock_target_root" "$image_root" "$target_root" 2>/dev/null || true)"
+    if [ -z "$stock_image_root" ] || [ ! -d "$stock_image_root" ]; then
+        stock_image_root="$(select_mounted_image_root "$part" "$stock_mount_point" "$stock_target_root")" || abort "Failed selecting stock $part image root"
+    fi
+    stock_uuid="$(erofs_stock_uuid "$img" 2>/dev/null || true)"
+    fs_config="$WORK/$part-erofs-fs_config"
+    file_contexts="$WORK/$part-erofs-file_contexts"
+    ui_print "- df after extraction:"
+    df "$HEAVY_WORKDIR" 2>&1 | while read line; do ui_print "  $line"; done
+    ui_print "- selected target root: $target_root"
+    ui_print "- mkfs source root: $image_root"
+    ui_print "- stock target root: $stock_target_root"
+    ui_print "- stock image root: $stock_image_root"
+    if [ "$image_root" = "$target_root" ]; then
+        ui_print "WARNING: $part IMAGE_ROOT equals TARGET_ROOT; verify this is really correct"
+    fi
+    if [ "$part" = "system" ]; then
+        ui_print "- system image root top entries:"
+        find "$image_root" -maxdepth 2 2>/dev/null | sed -n '1,80p' | while IFS= read -r p; do ui_print "  $p"; done
+        ui_print "- system selected target root:"
+        ui_print "  $target_root"
+    fi
+    du_log="$WORK/$part-extracted-root-du.log"
+    {
+        du -sk "$extracted" 2>/dev/null
+        du -sk "$target_root" 2>/dev/null
+        du -sk "$image_root" 2>/dev/null
+    } >"$du_log" 2>&1 || true
+    print_log_tail "$du_log"
+    prepare_erofs_metadata_from_stock "$part" "$stock_image_root" "$image_root" "$fs_config" "$file_contexts"
+    rm -f "$img"
+    ui_print "- removed dumped source image: $img"
+    df "$HEAVY_WORKDIR" 2>&1 | while read line; do ui_print "  $line"; done
+    ui_print "- Patching extracted target root in-place for $part: $target_root"
+    validate_originals_in_tree "$target_root" "$part"
+    replace_payloads_in_tree "$target_root" "$part"
+    delete_stale_artifacts_in_tree "$target_root" "$part"
+    write_partition_marker "$target_root" "$part"
+    validate_patched_in_tree "$target_root" "$part"
+
+    compression="$(manifest_string erofs_compression)"
+    [ -n "$compression" ] || compression="lz4hc,12"
+    ui_print "- Repacking $part EROFS"
+    run_mkfs_erofs_with_metadata "$part" "$out" "$image_root" "$compression" "$stock_uuid" "$fs_config" "$file_contexts"
+    if [ -n "$FSCK_EROFS" ] && [ -x "$FSCK_EROFS" ]; then
+        run_logged "fsck-erofs-${part}" "$FSCK_EROFS" "$out" || abort "fsck.erofs failed for $part"
+    fi
+    verify="$HEAVY_WORKDIR/$part-erofs-verify"
+    mkdir -p "$verify"
+    extract_erofs_image "$out" "$verify" "$part"
+    verify_root="$EROFS_EXTRACT_ROOT"
+    validate_patched_in_tree "$verify_root" "$part"
+    if ensure_erofs_image_fits_mapper "$part" "$source_size" "$out" "$block" "$size"; then
+        ui_print "- size check allows writeback for $part"
+    else
+        rc="$?"
+        if [ "$rc" = "2" ]; then
+            ui_print "ERROR: $part rebuilt image does not fit target block after resize attempt; skipping writeback"
+            INSTALL_BLOCKED=1
+            return 2
+        fi
+    fi
+    ui_print "- Flashing validated $part image"
+    run_logged "dd-${part}-flash-image" "$DD" if="$out" of="$block" bs=1048576 conv=fsync || abort "Failed flashing $part image"
+}
+
+install_partition() {
+    part="$1"
+    if ! partition_needs_work "$part"; then
+        ui_print "- Skipping $part partition; all targets already patched"
+        return
+    fi
+    case "$part" in
+        system)
+            block="$SYSTEM_BLOCK"; fs="$SYSTEM_FS"; size="$SYSTEM_SIZE"; mountvar="SYSTEM_MOUNT" ;;
+        system_ext)
+            block="$SYSTEM_EXT_BLOCK"; fs="$SYSTEM_EXT_FS"; size="$SYSTEM_EXT_SIZE"; mountvar="SYSTEM_EXT_MOUNT" ;;
+        *) abort "Internal partition error: $part" ;;
+    esac
+    unmount_classification_mount "$part"
+    case "$fs" in
+        ext4) install_ext4_partition "$part" "$block" "$mountvar" ;;
+        erofs) install_erofs_partition "$part" "$block" "$size" ;;
+        *) abort "Unsupported filesystem for $part: $fs" ;;
+    esac
+}
+
+guard_device() {
+    STEP="validate target device"
+    expected_device="$(manifest_string expected_device)"
+    [ -n "$expected_device" ] || expected_device="$(manifest_string ro_product_device)"
+    accepted_fingerprints="$(manifest_array_strings accepted_fingerprints)"
+    [ -n "$accepted_fingerprints" ] || accepted_fingerprints="$(manifest_string expected_fingerprint)"
+    [ -n "$accepted_fingerprints" ] || accepted_fingerprints="$(manifest_string ro_build_fingerprint)"
+    expected_build_release="$(manifest_string expected_build_release)"
+    expected_build_sdk="$(manifest_string expected_build_sdk)"
+    expected_build_id="$(manifest_string expected_build_id)"
+    expected_build_incremental="$(manifest_string expected_build_incremental)"
+    [ -n "$expected_device" ] || abort "manifest missing expected_device"
+    [ -n "$accepted_fingerprints" ] || abort "manifest missing accepted_fingerprints"
+    accepted_fp_file="$WORK/accepted_fingerprints.txt"
+    write_accepted_fingerprint_file "$accepted_fp_file"
+    [ -s "$accepted_fp_file" ] || abort "manifest accepted_fingerprints parsed empty"
+    actual_device="$(prop_value ro.product.device)"
+    actual_system_device="$(prop_value ro.product.system.device)"
+    actual_product_device="$(prop_value ro.product.product.device)"
+    actual_vendor_device="$(prop_value ro.product.vendor.device)"
+    actual_device_name="$(prop_value ro.product.name)"
+    actual_fingerprint="$(prop_value ro.build.fingerprint)"
+    actual_build_release="$(prop_value ro.build.version.release)"
+    actual_build_sdk="$(prop_value ro.build.version.sdk)"
+    actual_build_id="$(prop_value ro.build.id)"
+    actual_build_incremental="$(prop_value ro.build.version.incremental)"
+    actual_system_fingerprint="$(prop_value ro.system.build.fingerprint)"
+    actual_product_fingerprint="$(prop_value ro.product.build.fingerprint)"
+    actual_vendor_fingerprint="$(prop_value ro.vendor.build.fingerprint)"
+    actual_bootimage_fingerprint="$(prop_value ro.bootimage.build.fingerprint)"
+    actual_odm_fingerprint="$(prop_value ro.odm.build.fingerprint)"
+    actual_system_ext_fingerprint="$(prop_value ro.system_ext.build.fingerprint)"
+    actual_slot="$(prop_value ro.boot.slot_suffix)"
+    [ -n "$actual_slot" ] || actual_slot="$(prop_value ro.boot.slot)"
+
+    ui_print "- Expected device: $expected_device"
+    ui_print "- Device props:"
+    ui_print "  ro.product.device=$actual_device"
+    ui_print "  ro.product.system.device=$actual_system_device"
+    ui_print "  ro.product.product.device=$actual_product_device"
+    ui_print "  ro.product.vendor.device=$actual_vendor_device"
+    ui_print "  ro.product.name=$actual_device_name"
+    ui_print "- Accepted ro.build.fingerprint values:"
+    while IFS= read -r fp; do
+        ui_print "  \"$fp\""
+    done < "$accepted_fp_file"
+    ui_print "- Build diagnostics:"
+    ui_print "  ro.build.version.release=$actual_build_release expected=$expected_build_release"
+    ui_print "  ro.build.version.sdk=$actual_build_sdk expected=$expected_build_sdk"
+    ui_print "  ro.build.id=$actual_build_id expected=$expected_build_id"
+    ui_print "  ro.build.version.incremental=$actual_build_incremental expected=$expected_build_incremental"
+    ui_print "- Fingerprint props:"
+    ui_print "  ro.build.fingerprint=$actual_fingerprint"
+    ui_print "  ro.system.build.fingerprint=$actual_system_fingerprint"
+    ui_print "  ro.product.build.fingerprint=$actual_product_fingerprint"
+    ui_print "  ro.vendor.build.fingerprint=$actual_vendor_fingerprint"
+    ui_print "  ro.bootimage.build.fingerprint=$actual_bootimage_fingerprint"
+    ui_print "  ro.odm.build.fingerprint=$actual_odm_fingerprint"
+    ui_print "  ro.system_ext.build.fingerprint=$actual_system_ext_fingerprint"
+    ui_print "- Active slot: $actual_slot"
+
+    case "
+$actual_device
+$actual_system_device
+$actual_product_device
+$actual_vendor_device
+$actual_device_name
+" in
+        *"
+$expected_device
+"*) ;;
+        *) abort "Device mismatch: expected $expected_device; got ro.product.device=$actual_device ro.product.system.device=$actual_system_device ro.product.product.device=$actual_product_device ro.product.vendor.device=$actual_vendor_device ro.product.name=$actual_device_name" ;;
+    esac
+
+    if ! printf '%s\n' "$actual_fingerprint" | grep -Fx -f "$accepted_fp_file" >/dev/null 2>&1; then
+        ui_print "- Fingerprint compare debug:"
+        ui_print "  actual escaped: $(debug_escape "$actual_fingerprint")"
+        ui_print "  accepted escaped:"
+        while IFS= read -r fp; do
+            ui_print "    $(debug_escape "$fp")"
+        done < "$accepted_fp_file"
+        abort "Fingerprint mismatch: ro.build.fingerprint is not accepted"
+    fi
+}
+
+main() {
+    print_banner
+    init_workdirs
+    extract_metadata_and_tools
+    report_avb_status
+    validate_payload_allowlist
+    extract_payload
+    guard_device
+    detect_slot
+    resolve_partition system
+    resolve_partition system_ext
+    detect_block_size system "$SYSTEM_BLOCK" "$SYSTEM_PART"
+    detect_block_size system_ext "$SYSTEM_EXT_BLOCK" "$SYSTEM_EXT_PART"
+    detect_fs_type system "$SYSTEM_BLOCK"
+    detect_fs_type system_ext "$SYSTEM_EXT_BLOCK"
+    print_recovery_mount_layout
+    classify_current_targets
+    detect_reflash_marker
+    print_install_plan
+    if ! any_partition_needs_work; then
+        ui_print " "
+        ui_print "No partition changes required"
+        sync
+        cleanup
+        exit 0
+    fi
+    install_partition system
+    install_partition system_ext
+    if [ "$INSTALL_BLOCKED" = "1" ]; then
+        ui_print " "
+        ui_print "Install blocked: one or more rebuilt images do not fit target partitions"
+        ui_print "No oversized image was written"
+        [ -n "$NOT_FLASHABLE_OVERSIZE" ] && ui_print "not_flashable_oversize=$NOT_FLASHABLE_OVERSIZE"
+        cleanup
+        exit 1
+    fi
+    sync
+    ui_print " "
+    ui_print "Install complete. No automatic reboot."
+    cleanup
+    exit 0
+}
+
+main "$@"

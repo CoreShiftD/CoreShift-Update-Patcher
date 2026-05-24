@@ -1,0 +1,7 @@
+id=coreshift_update_patcher
+name=CoreShift Update Patcher
+version=v1.0
+versionCode=1
+author=CoreshiftD
+description=Recovery-flashable ROM update patcher template with EROFS and EXT4 support, active-slot detection, idempotent hash validation, system_root handling, and AVB report-only behavior.
+support=https://github.com/CoreshiftD
