@@ -1,8 +1,19 @@
 # CoreShift Update Patcher v1.0
 
-Initial public template release for CoreShift Update Patcher.
+## Reinitialized release package
 
-- Reinitialized the public template from the renewed confirmed-working recovery
+- Reinitialized release artifacts from the verified working source tree.
+- Fixed EROFS UUID validation: only canonical UUIDs are accepted.
+- Invalid or missing UUIDs now omit `-U` instead of failing `mkfs.erofs`.
+- Confirmed on-device dry-run: `-U 9` fails, while no-UUID and valid-UUID builds pass.
+- Preserves current metadata-matching EROFS rebuild improvements.
+- Recovery flash/writeback remains experimental until confirmed on the target device.
+
+## Initial release baseline
+
+Initial release baseline for CoreShift Update Patcher.
+
+- Reinitialized the package from the renewed confirmed-working recovery
   flashable package.
 - Preserved the generic installer skeleton with EROFS, EXT4, active-slot,
   logical partition, `system_root`, idempotent hash validation, payload
@@ -21,6 +32,5 @@ Initial public template release for CoreShift Update Patcher.
   place.
 - Redirected helper output to logs so colored extractor/mkfs progress cannot
   leak raw text into recovery's updater command channel.
-- Kept the public template free of proprietary OEM binaries.
-- Published the INOI A75 Elegance runtime fixes as a separate release artifact
-  copied byte-for-byte from the confirmed-working `example.zip`.
+- Rebuilt release artifacts from the same current repository
+  source so they carry the synchronized updater, tools, and payload.

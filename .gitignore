@@ -4,12 +4,6 @@
 _private_payloads/
 work/
 example.zip
-dist/*.zip
-
-# Private or generated payload files must not be committed.
-payload/**/*
-!payload/**/
-!payload/**/.gitkeep
 
 # Local editor and OS files.
 .DS_Store

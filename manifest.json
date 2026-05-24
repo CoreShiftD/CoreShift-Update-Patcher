@@ -1,0 +1,118 @@
+{
+  "name": "INOI production runtime/framework fixes",
+  "version": 1,
+  "expected_device": "INOI_A75_Elegance",
+  "accepted_fingerprints": [
+    "INOI//:14/UP1A.231005.007/51023:user/release-keys",
+    "INOI/INOI_A75_Elegance/INOI_A75_Elegance:14/UP1A.231005.007/51023:user/release-keys"
+  ],
+  "expected_build_release": "14",
+  "expected_build_sdk": "34",
+  "expected_build_id": "UP1A.231005.007",
+  "expected_build_incremental": "51023",
+  "allow_resize": true,
+  "resize_safety_margin_bytes": 67108864,
+  "dynamic_partition_alignment_bytes": 1048576,
+  "erofs_compression": "lz4hc,12",
+  "erofs_pcluster_size": 65536,
+  "original_framework_jar_sha256": "e0a5f3b84dab7fa7f2ebd9326da031635ce33106a98287ce34098bd32cd2bbe6",
+  "patched_framework_jar_sha256": "cd94595aed8519c4eba5f8ec0920f88e826c81caed16ffd3fb33f63c96ae76e2",
+  "original_lib64_libandroid_runtime_so_sha256": "0a009598815a0d83767ef9d5954f7653bbbed5a0f8e6d91d046dcd0b89fa57cd",
+  "patched_lib64_libandroid_runtime_so_sha256": "e4b98718cceb73b505489ec95a51158228a95b6f7f3a1f9c42578d28f768181f",
+  "original_lib_libandroid_runtime_so_sha256": "1a2a9ea70915532453d30f3a211585e4bb8c5e0f667caa230591a2de7170ba5c",
+  "patched_lib_libandroid_runtime_so_sha256": "98c418cf1b1c77c359e5ceea38c18b75053b83fbc1d90be6afab752f5784407e",
+  "original_mediatek_services_jar_sha256": "411cc891b514350424c523b5454baaade9ec978e59177c53e3f981b3fba22a43",
+  "patched_mediatek_services_jar_sha256": "7090447448a3960d1a6cfbae2a51ddd8780b735aa3222164a7c660f69c5408a7",
+  "files": {
+    "system/framework/framework.jar": {
+      "partition": "system",
+      "target_path": "/system/framework/framework.jar",
+      "original_sha256": "e0a5f3b84dab7fa7f2ebd9326da031635ce33106a98287ce34098bd32cd2bbe6",
+      "patched_sha256": "cd94595aed8519c4eba5f8ec0920f88e826c81caed16ffd3fb33f63c96ae76e2",
+      "size": 40467959
+    },
+    "system/lib64/libandroid_runtime.so": {
+      "partition": "system",
+      "target_path": "/system/lib64/libandroid_runtime.so",
+      "original_sha256": "0a009598815a0d83767ef9d5954f7653bbbed5a0f8e6d91d046dcd0b89fa57cd",
+      "patched_sha256": "e4b98718cceb73b505489ec95a51158228a95b6f7f3a1f9c42578d28f768181f",
+      "size": 2546024
+    },
+    "system/lib/libandroid_runtime.so": {
+      "partition": "system",
+      "target_path": "/system/lib/libandroid_runtime.so",
+      "original_sha256": "1a2a9ea70915532453d30f3a211585e4bb8c5e0f667caa230591a2de7170ba5c",
+      "patched_sha256": "98c418cf1b1c77c359e5ceea38c18b75053b83fbc1d90be6afab752f5784407e",
+      "size": 1700580
+    },
+    "system_ext/framework/mediatek-services.jar": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/mediatek-services.jar",
+      "original_sha256": "411cc891b514350424c523b5454baaade9ec978e59177c53e3f981b3fba22a43",
+      "patched_sha256": "7090447448a3960d1a6cfbae2a51ddd8780b735aa3222164a7c660f69c5408a7",
+      "size": 498465
+    }
+  },
+  "delete": {
+    "system_ext/framework/mediatek-services.jar.fsv_meta": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/mediatek-services.jar.fsv_meta",
+      "original_sha256": "cb5105efccf194d82823ddb40292dca811a7b94a4a6c97a5053189f5d69a9a0d",
+      "size": 8192
+    },
+    "system_ext/framework/oat/arm/mediatek-services.odex": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm/mediatek-services.odex",
+      "original_sha256": "a5be159a952314a9d1d9c1d53d667c73a98cda039f76f9d5b52dff00b4717ca6",
+      "size": 21156
+    },
+    "system_ext/framework/oat/arm/mediatek-services.vdex": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm/mediatek-services.vdex",
+      "original_sha256": "f755736369b8d66d5884e3327b7620fb6a9565927d0bb6987646b8fae6b84f25",
+      "size": 4840
+    },
+    "system_ext/framework/oat/arm64/mediatek-services.odex": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm64/mediatek-services.odex",
+      "original_sha256": "dd80faaaf7f94fb2fdc2cdfc543660b7c6461138e726a6b235ffae2b70098ef6",
+      "size": 21424
+    },
+    "system_ext/framework/oat/arm64/mediatek-services.vdex": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm64/mediatek-services.vdex",
+      "original_sha256": "f755736369b8d66d5884e3327b7620fb6a9565927d0bb6987646b8fae6b84f25",
+      "size": 4840
+    },
+    "system_ext/framework/oat/arm/mediatek-services.odex.fsv_meta": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm/mediatek-services.odex.fsv_meta",
+      "original_sha256": "97cf5e07ef76511464aa6cc00d932f819a1ad174f9222467f58397c4e473ab95",
+      "size": 8192
+    },
+    "system_ext/framework/oat/arm/mediatek-services.vdex.fsv_meta": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm/mediatek-services.vdex.fsv_meta",
+      "original_sha256": "2fbcd61d13d97b872046d4d7da8fe0be6abffdd7e6ed9fea7be50b7dd775f043",
+      "size": 8192
+    },
+    "system_ext/framework/oat/arm64/mediatek-services.odex.fsv_meta": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm64/mediatek-services.odex.fsv_meta",
+      "original_sha256": "b1806d11040da5ee29e4a56f4e682c408520c62cbd053a40461e102a399db93d",
+      "size": 8192
+    },
+    "system_ext/framework/oat/arm64/mediatek-services.vdex.fsv_meta": {
+      "partition": "system_ext",
+      "target_path": "/system_ext/framework/oat/arm64/mediatek-services.vdex.fsv_meta",
+      "original_sha256": "2fbcd61d13d97b872046d4d7da8fe0be6abffdd7e6ed9fea7be50b7dd775f043",
+      "size": 8192
+    }
+  },
+  "payload_paths": [
+    "payload/system/framework/framework.jar",
+    "payload/system/lib64/libandroid_runtime.so",
+    "payload/system/lib/libandroid_runtime.so",
+    "payload/system_ext/framework/mediatek-services.jar"
+  ]
+}

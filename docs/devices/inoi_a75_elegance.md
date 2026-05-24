@@ -1,12 +1,10 @@
 # INOI A75 Elegance
 
-INOI A75 Elegance is included as an example device profile reference for the
-CoreShift Update Patcher template.
+INOI A75 Elegance is included as a device profile reference for CoreShift
+Update Patcher.
 
-The public template does not include INOI payload files, stock blobs, patched
-framework files, or patched native libraries. The INOI release artifact is
-generated separately by copying the confirmed-working `example.zip` without
-rebuilding or modifying it.
+This release includes the INOI payload files from the verified release package.
+The INOI release artifact is rebuilt from the current repository content.
 
 The current INOI package uses the metadata-preserving EROFS pipeline:
 
@@ -22,6 +20,6 @@ The current INOI package uses the metadata-preserving EROFS pipeline:
 
 For the v1.0 release artifact:
 
-- Source of truth: `example.zip`
+- Source of truth: verified working source tree
 - Output: `dist/CoreShift_Update_Patcher_INOI_A75_Elegance_Runtime_Fixes_v1.0.zip`
-- Required behavior: byte-identical copy
+- Required behavior: generated from the flashable package staging directory

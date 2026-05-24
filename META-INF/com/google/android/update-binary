@@ -1606,15 +1606,11 @@ erofs_stock_uuid() {
         strings "$image" 2>/dev/null | grep -i 'uuid' >>"$log" 2>&1 || true
     fi
 
-    awk -F: '/Filesystem UUID|UUID/ {
-        v=$2
-        sub(/^[ \t]*/, "", v)
-        sub(/[ \t]*$/, "", v)
-        if (v ~ /^[0-9a-fA-F-][0-9a-fA-F-]*$/) {
-            print v
-            exit
-        }
-    }' "$log"
+    grep -Eio '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$log" 2>/dev/null | head -n 1
+}
+
+erofs_uuid_is_valid() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 }
 
 stock_selinux_label() {
@@ -1731,8 +1727,10 @@ run_mkfs_erofs_with_metadata() {
         ui_print "WARNING: fixed timestamp empty; omitting -T"
     fi
 
-    if [ -n "$stock_uuid" ]; then
+    if [ -n "$stock_uuid" ] && erofs_uuid_is_valid "$stock_uuid"; then
         mkfs_args="$mkfs_args -U $stock_uuid"
+    elif [ -n "$stock_uuid" ]; then
+        ui_print "WARNING: invalid stock UUID '$stock_uuid'; omitting -U"
     else
         ui_print "WARNING: stock UUID unavailable; omitting -U"
     fi

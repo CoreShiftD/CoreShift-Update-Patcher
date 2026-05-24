@@ -1,11 +1,10 @@
 # CoreShift Update Patcher
 
-CoreShift Update Patcher is a generic recovery-flashable ROM update patcher
-template. It provides a public-safe package skeleton for building device
-profiles that patch selected ROM files from recovery while keeping the template
-free of OEM binaries.
+CoreShift Update Patcher is a recovery-flashable ROM update patcher package. It
+provides a known-working installer structure for device profiles that patch
+selected ROM files from recovery.
 
-The template is designed around a known-working recovery installer structure and
+The package is designed around a known-working recovery installer structure and
 supports:
 
 - EROFS partition handling.
@@ -31,9 +30,10 @@ device and firmware build.
 - `META-INF/` recovery installer structure copied from the confirmed-working
   package.
 - `module.prop` with generic CoreShift Update Patcher metadata.
-- `manifest.example.json` as a public template manifest.
-- `checksums.example.txt` for the public template files.
-- `payload/` directory skeleton with placeholder files only.
+- `manifest.json` copied from the release package.
+- `manifest.example.json` as an example device manifest.
+- `checksums.txt` for generated release artifacts.
+- `payload/` files copied from the release package.
 - Documentation and example device-profile notes.
 - Release build and validation scripts.
 
@@ -59,17 +59,10 @@ device and firmware build.
 - External helper output is redirected to logs so recovery stdout remains a
   clean updater command channel.
 
-## What Is Not Included
-
-No proprietary OEM binaries are included in the template. The payload tree only
-contains `.gitkeep` placeholders. Device-specific patched files must be supplied
-by the maintainer of a private profile or release process.
-
 ## Device Profiles
 
-INOI A75 Elegance is documented only as an example device profile and as a
-separate release artifact. The INOI release ZIP is not rebuilt by the template
-builder; it is copied byte-for-byte from the confirmed-working `example.zip`.
+INOI A75 Elegance is documented as the bundled device profile for this release.
+Release ZIPs are rebuilt from the current repository content.
 
 ## Build
 
@@ -81,14 +74,12 @@ scripts/build-releases.sh
 
 This creates:
 
-- `dist/CoreShift_Update_Patcher_Template_v1.0.zip`
 - `dist/CoreShift_Update_Patcher_INOI_A75_Elegance_Runtime_Fixes_v1.0.zip`
+- `dist/CoreShift_Update_Patcher_Template_v1.0.zip`
 
-The INOI artifact is produced only with:
-
-```sh
-cp example.zip dist/CoreShift_Update_Patcher_INOI_A75_Elegance_Runtime_Fixes_v1.0.zip
-```
+Both artifacts are produced from the same flashable package staging directory
+and should match byte-for-byte. The ZIPs contain flashable content only:
+`META-INF/`, `payload/`, `module.prop`, and `manifest.json`.
 
 ## Validate
 
@@ -96,9 +87,9 @@ cp example.zip dist/CoreShift_Update_Patcher_INOI_A75_Elegance_Runtime_Fixes_v1.
 scripts/validate-releases.sh
 ```
 
-Validation checks ZIP integrity, verifies that the INOI release ZIP is
-byte-identical to `example.zip`, confirms the public template payload contains
-no OEM binaries, rejects installer commands that disable AVB or verity, confirms
-there is no hard dependency on `/data/adb/ksu/bin`, and verifies template
-checksums. Runtime dry validation should treat EROFS oversize as a warning and
-report whether install mode would resize with `lptools`.
+Validation checks ZIP integrity, verifies that the generated artifacts match,
+checks `checksums.txt`, rejects installer commands that disable AVB or verity,
+confirms there is no hard dependency on `/data/adb/ksu/bin`, and syntax-checks
+the source and embedded `update-binary` files. Runtime dry validation should
+treat EROFS oversize as a warning and report whether install mode would resize
+with `lptools`.

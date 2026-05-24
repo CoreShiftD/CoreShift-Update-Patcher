@@ -1,10 +1,9 @@
 # INOI A75 Elegance Example
 
-This directory documents the INOI A75 Elegance profile as an example only.
+This directory documents the INOI A75 Elegance profile bundled in this release.
 
-The public repository does not include OEM payload binaries. The working INOI
-release ZIP is produced outside the generic template build by directly copying
-the confirmed-working `example.zip` into `dist/`.
+The working INOI release ZIP is built from the current repository content that
+was reinitialized from the verified working source tree.
 
 The current package model preserves stock EROFS metadata, avoids
 `big_pcluster`, uses `extract.erofs -x`, and resizes logical partitions with
